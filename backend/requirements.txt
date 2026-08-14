@@ -1,0 +1,10 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+supabase==2.10.0
+#google-generativeai==0.8.3
+PyMuPDF==1.24.14
+langchain-text-splitters==0.3.2
+python-dotenv==1.0.1
+python-multipart==0.0.12
+httpx==0.27.2
+ollama==0.6.2
