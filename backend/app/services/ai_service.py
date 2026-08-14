@@ -35,7 +35,7 @@ _client = ollama.Client(host=_OLLAMA_HOST)
 
 # ── Model identifiers ─────────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.1")
+CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 
 # nomic-embed-text outputs 768-dim vectors — matches Supabase pgvector(768)
 EMBEDDING_DIMENSION = 768
@@ -121,28 +121,66 @@ def generate_query_embedding(query: str) -> list[float]:
 # ── Summarisation ─────────────────────────────────────────────────────────────
 
 _SUMMARY_SYSTEM_PROMPT = textwrap.dedent("""\
-    You are an expert document analyst. Your task is to produce a concise,
-    structured summary of the provided document text.
+    You are an expert document analyst producing a summary for someone who has
+    NOT read the source document. Precision and grounding matter more than
+    polish.
 
-    Format your response EXACTLY as follows — do NOT deviate:
+    GROUNDING RULES (do not violate these):
+    - Use ONLY information that is explicitly present in the document text
+      you are given. Never supplement with outside knowledge, assumptions,
+      or general facts about the topic — even if you "know" more about it.
+    - Do not infer facts, numbers, dates, or names that are not stated
+      verbatim or near-verbatim in the text.
+    - If the extracted text is fragmented, garbled, or clearly incomplete
+      (e.g. from OCR/PDF extraction artifacts), summarise only what is
+      legible and add one line under "Extraction Notes" flagging this —
+      omit that section entirely if the text is clean.
+    - If the document is too short or sparse to support a section below
+      (e.g. no clear insights beyond the overview), write "Not enough
+      content in the document to determine this" for that section instead
+      of inventing filler bullets.
+
+    LANGUAGE:
+    - Respond in the same language as the source document. If the document
+      mixes languages, use whichever language dominates the body text.
+
+    STYLE:
+    - Never open with meta-commentary such as "Based on the provided text"
+      or "This document appears to be about". State facts directly.
+    - Be concise: prefer one well-written sentence over three vague ones.
+    - Scale the number of bullet points to the document's actual depth —
+      a 2-page memo should not be padded to look like a 40-page report.
+
+    Format your response EXACTLY as follows — do NOT add extra sections,
+    headers, or commentary outside this structure:
 
     ## 📄 Document Summary
 
     **Overview:**
-    <2–3 sentence high-level description of what the document is about>
+    <2–3 sentences: what this document is, who it's for/from, and its
+    primary purpose>
 
     **Key Topics Covered:**
-    • <topic 1>
+    • <topic 1 — one line, specific not generic>
     • <topic 2>
     • <topic 3>
-    (include as many bullet points as are relevant, minimum 3)
+    (as many as are genuinely present in the text; do not pad to a fixed count)
 
     **Main Insights & Takeaways:**
-    • <insight or conclusion 1>
-    • <insight or conclusion 2>
-    • <insight or conclusion 3>
+    • <a concrete conclusion, finding, decision, or recommendation from the text>
+    • <insight 2>
+    • <insight 3>
+    (only include insights actually stated or clearly implied in the text)
 
-    **Document Type:** <e.g., Research Paper / Report / Manual / Contract / Other>
+    **Key Figures & Data:**
+    • <notable number, date, name, or statistic and its context>
+    (Only include this section header at all if the document actually
+    contains a figure/date/statistic worth surfacing. If there is nothing
+    like that, skip both the header and this section completely — do not
+    write "none", "N/A", or any placeholder text in its place.)
+
+    **Document Type:** <e.g., Research Paper / Report / Manual / Contract /
+    Meeting Notes / Other — infer from structure and tone>
 """)
 
 
@@ -151,7 +189,9 @@ def generate_summary(text: str) -> str:
     Generate a structured, bullet-point summary of full PDF text.
 
     Truncates very long documents to the first 30 000 characters to stay
-    within the local model's practical context window.
+    within the local model's practical context window, and tells the model
+    up front whether truncation happened so it doesn't imply completeness
+    it can't back up.
 
     Args:
         text: The full extracted PDF text.
@@ -159,7 +199,16 @@ def generate_summary(text: str) -> str:
     Returns:
         A markdown-formatted summary string.
     """
-    truncated_text = text[:30_000] if len(text) > 30_000 else text
+    was_truncated = len(text) > 30_000
+    truncated_text = text[:30_000] if was_truncated else text
+
+    truncation_note = (
+        "\n\nNOTE: This is only the first ~30,000 characters of a longer "
+        "document. Summarise faithfully based on this excerpt alone — do "
+        "not claim to cover the full document."
+        if was_truncated
+        else ""
+    )
 
     try:
         response = _client.chat(
@@ -168,7 +217,10 @@ def generate_summary(text: str) -> str:
                 {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": f"Please summarise the following document:\n\n{truncated_text}",
+                    "content": (
+                        f"Please summarise the following document:\n\n"
+                        f"{truncated_text}{truncation_note}"
+                    ),
                 },
             ],
         )

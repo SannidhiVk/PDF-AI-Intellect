@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { FileText, ChevronDown, ChevronUp, BookOpen, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -12,12 +14,17 @@ interface SummaryViewProps {
 export default function SummaryView({ summary, filename }: SummaryViewProps) {
   const [isExpanded, setIsExpanded] = useState(true);
 
-  // Split summary into readable paragraphs
-  const paragraphs = summary.split(/\n+/).filter((p) => p.trim().length > 0);
-
   // Word count
   const wordCount = summary.split(/\s+/).filter(Boolean).length;
   const readingTime = Math.ceil(wordCount / 200); // avg 200 wpm
+
+  // Plain-text preview for the collapsed state (strip common markdown symbols)
+  const plainPreview = summary
+    .replace(/#{1,6}\s*/g, "")
+    .replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\n+/g, " ")
+    .trim();
 
   return (
     <div className="rounded-2xl border border-gray-800/60 bg-gray-900/60 backdrop-blur-sm overflow-hidden">
@@ -68,19 +75,22 @@ export default function SummaryView({ summary, filename }: SummaryViewProps) {
         )}
       >
         <div className="overflow-y-auto max-h-[600px] px-6 py-5 scrollbar-thin">
-          {paragraphs.length > 0 ? (
-            <div className="space-y-3">
-              {paragraphs.map((paragraph, index) => (
-                <p
-                  key={index}
-                  className={cn(
-                    "text-sm leading-relaxed text-gray-300",
-                    index === 0 && "text-gray-200 font-medium"
-                  )}
-                >
-                  {paragraph}
-                </p>
-              ))}
+          {summary.trim().length > 0 ? (
+            <div
+              className={cn(
+                "prose prose-invert prose-sm max-w-none",
+                "prose-headings:text-gray-100 prose-headings:font-semibold",
+                "prose-p:text-gray-300 prose-p:leading-relaxed",
+                "prose-strong:text-gray-200 prose-strong:font-semibold",
+                "prose-li:text-gray-300",
+                "prose-ul:my-2 prose-ol:my-2",
+                "prose-h2:text-base prose-h2:mt-4 prose-h2:mb-1",
+                "prose-h3:text-sm prose-h3:mt-3 prose-h3:mb-1"
+              )}
+            >
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {summary}
+              </ReactMarkdown>
             </div>
           ) : (
             <p className="text-sm text-gray-500">No summary available.</p>
@@ -88,15 +98,15 @@ export default function SummaryView({ summary, filename }: SummaryViewProps) {
         </div>
 
         {/* Gradient fade at the bottom if content is long */}
-        {paragraphs.length > 5 && (
+        {summary.split("\n").length > 10 && (
           <div className="h-8 bg-gradient-to-t from-gray-900/60 to-transparent -mt-8 relative z-10 pointer-events-none" />
         )}
       </div>
 
-      {/* Collapsed preview */}
-      {!isExpanded && paragraphs.length > 0 && (
+      {/* Collapsed preview — plain text, no markdown symbols */}
+      {!isExpanded && plainPreview.length > 0 && (
         <div className="px-6 py-3 border-t border-gray-800/40">
-          <p className="text-xs text-gray-500 truncate italic">{paragraphs[0]}</p>
+          <p className="text-xs text-gray-500 truncate italic">{plainPreview}</p>
         </div>
       )}
     </div>
