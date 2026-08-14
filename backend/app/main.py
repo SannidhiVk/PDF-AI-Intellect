@@ -359,12 +359,24 @@ async def chat(body: ChatRequest):
         )
 
     # ── Retrieve relevant chunks ──────────────────────────────────────────────
+    # NOTE: match_count=10 and match_threshold=0.0 are deliberately generous.
+    # For small documents (a handful of chunks), similarity filtering can
+    # incorrectly drop chunks that are still relevant just because their
+    # section mixes topics (diluting the embedding). Retrieving more chunks
+    # and letting the LLM's grounded prompt do the relevance filtering is
+    # safer than dropping context at the DB layer. Revisit these numbers
+    # once you're testing with larger, multi-page documents.
     try:
         context_chunks = db_service.search_similar_chunks(
             document_id=body.document_id,
             query_embedding=query_embedding,
-            match_count=5,
+            match_count=10,
+            match_threshold=0.0,
         )
+        print(f"\n{'='*60}\nRETRIEVED {len(context_chunks)} CHUNKS:")
+        for i, chunk in enumerate(context_chunks, 1):
+            print(f"\n--- Chunk {i} ({len(chunk)} chars) ---\n{chunk}")
+        print(f"{'='*60}\n")
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

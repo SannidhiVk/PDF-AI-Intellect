@@ -11,7 +11,19 @@ import fitz  # PyMuPDF
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ── Configuration ────────────────────────────────────────────────────────────
-CHUNK_SIZE = 1000       # characters per chunk
+# CHUNK_SIZE was raised from 1000 → 2000. At 1000, short documents (e.g. a
+# ~1,900-char single-page resume) were being split into 2 chunks right in
+# the middle of a coherent section (e.g. the "Projects" list), forcing the
+# LLM to synthesize a complete list across two separate context blocks with
+# overlapping/duplicated text at the seam. Small local models in particular
+# were prone to treating the duplicated text as "already covered" and
+# truncating their answer early, silently dropping items.
+#
+# 2000 keeps small/medium documents (resumes, short reports, memos) as a
+# SINGLE chunk whenever possible, which sidesteps this class of bug entirely
+# for the common case. Larger documents will still be split as expected —
+# this only changes the split point, not whether large documents get chunked.
+CHUNK_SIZE = 2000       # characters per chunk
 CHUNK_OVERLAP = 200     # overlapping characters between consecutive chunks
 
 

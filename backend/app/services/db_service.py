@@ -155,6 +155,7 @@ def search_similar_chunks(
     document_id: str,
     query_embedding: list[float],
     match_count: int = 5,
+    match_threshold: float = 0.5,
 ) -> list[str]:
     """
     Retrieve the top-K most semantically similar chunks for a given query.
@@ -162,10 +163,21 @@ def search_similar_chunks(
     Calls the `match_document_chunks` Postgres function (defined via RPC),
     which uses pgvector's `<=>` cosine distance operator under the hood.
 
+    IMPORTANT: The parameter names below (filter_document_id, match_count,
+    match_threshold, query_embedding) must match EXACTLY what the SQL
+    function declares — PostgREST resolves RPC calls via strict named-
+    parameter matching against its schema cache, not fuzzy/positional
+    matching. If you rename an argument in the SQL function, update it
+    here too (and vice versa).
+
     Args:
         document_id:     UUID of the document to search within.
         query_embedding: 768-dimensional embedding of the user's question.
         match_count:     How many top chunks to return (default: 5).
+        match_threshold: Minimum cosine similarity (0-1) for a chunk to be
+                          considered a match (default: 0.5). Raise this for
+                          stricter relevance, lower it if legitimate chunks
+                          are being filtered out.
 
     Returns:
         A list of content strings for the top matching chunks, ordered by
@@ -178,8 +190,9 @@ def search_similar_chunks(
         "match_document_chunks",
         {
             "query_embedding": query_embedding,
-            "match_document_id": document_id,
+            "filter_document_id": document_id,
             "match_count": match_count,
+            "match_threshold": match_threshold,
         },
     ).execute()
 

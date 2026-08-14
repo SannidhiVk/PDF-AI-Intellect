@@ -243,6 +243,17 @@ _RAG_SYSTEM_PROMPT = textwrap.dedent("""\
     - Keep answers concise but complete.
     - Use bullet points or numbered lists when listing multiple items.
     - Do NOT fabricate information or draw on external knowledge.
+    - The context may be split into multiple chunks, and adjacent chunks may
+      contain OVERLAPPING or REPEATED text at their boundaries — this is a
+      normal artifact of how the document was split, not a signal that a
+      section is "already covered." Read every chunk fully before answering.
+    - When a question asks you to list, name, or enumerate items (e.g. "list
+      all X", "name every Y"), you MUST scan ALL provided chunks for
+      qualifying items before responding. Do not stop after finding items in
+      just the first chunk that mentions the topic — the same topic may
+      continue or repeat across other chunks too. Deduplicate identical
+      items, but never omit an item because a similar-looking one appeared
+      earlier in the context.
 """)
 
 
