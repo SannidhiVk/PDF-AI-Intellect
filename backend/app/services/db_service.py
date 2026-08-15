@@ -74,14 +74,23 @@ def save_document_metadata(
     user_id: str,
     file_name: str,
     file_url: str,
+    summary: str | None = None,
+    word_count: int | None = None,
 ) -> dict[str, Any]:
     """
     Insert a new row into the `documents` table and return the saved record.
 
     Args:
-        user_id:   The authenticated user's UUID (from Supabase Auth).
-        file_name: Original filename of the uploaded PDF.
-        file_url:  Public or signed URL of the file stored in Supabase Storage.
+        user_id:    The authenticated user's UUID (from Supabase Auth).
+        file_name:  Original filename of the uploaded PDF.
+        file_url:   Public or signed URL of the file stored in Supabase Storage.
+        summary:    The Groq-generated AI summary text, if already computed
+                    at upload time. Persisted so it survives page reloads —
+                    previously this was only returned in the upload response
+                    and never written to the DB, which is why summaries
+                    disappeared after the initial request.
+        word_count: Optional word count of the summary, so the frontend
+                    doesn't need to recompute it on every render.
 
     Returns:
         The inserted row as a dict (includes auto-generated `id` and
@@ -95,6 +104,10 @@ def save_document_metadata(
         "file_name": file_name,
         "file_url": file_url,
     }
+    if summary is not None:
+        payload["summary"] = summary
+    if word_count is not None:
+        payload["word_count"] = word_count
 
     # Use the service-role client so the insert succeeds regardless of the
     # documents RLS INSERT policy (which checks auth.uid(), a value that is
@@ -108,6 +121,55 @@ def save_document_metadata(
             f"Failed to save document metadata. Supabase response: {response}"
         )
 
+    return response.data[0]
+
+
+def update_document_summary(
+    document_id: str,
+    summary: str,
+    word_count: int | None = None,
+) -> dict[str, Any]:
+    """
+    Persist an AI-generated summary onto an existing document row.
+
+    Use this when summary generation happens as a separate step AFTER the
+    initial upload insert (e.g. triggered by an "Analyze" button, or a
+    background job) rather than inline during save_document_metadata().
+
+    This is likely the fix needed if your flow is:
+      1. Upload PDF -> insert row via save_document_metadata() (no summary yet)
+      2. User clicks "Analyze" -> Groq generates summary
+      3. <-- summary was being returned to the frontend but never written
+             back to Supabase here, so it vanished on next page load.
+
+    Args:
+        document_id: UUID of the document row to update.
+        summary:     The generated summary text.
+        word_count:  Optional word count to cache alongside it.
+
+    Returns:
+        The updated row as a dict.
+
+    Raises:
+        RuntimeError: If the update fails or matches no row.
+    """
+    payload: dict[str, Any] = {"summary": summary}
+    if word_count is not None:
+        payload["word_count"] = word_count
+
+    response = (
+        _get_service_client()
+        .table("documents")
+        .update(payload)
+        .eq("id", document_id)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            f"Failed to update summary for document {document_id}. "
+            f"Response: {response}"
+        )
     return response.data[0]
 
 
@@ -258,12 +320,62 @@ def get_documents_by_user(user_id: str) -> list[dict[str, Any]]:
     """
     response = (
         _get_service_client().table("documents")
-        .select("id, file_name, file_url, created_at")
+        .select("id, file_name, file_url, created_at, summary, word_count")
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
     )
     return response.data or []
+
+
+def delete_document(document_id: str, user_id: str) -> bool:
+    """
+    Delete a document and all of its dependent rows (chunks, in that order
+    to satisfy the FK constraint), scoped to the requesting user.
+
+    Ownership is enforced here in Python (same pattern as the rest of this
+    file) rather than relying on RLS, since all writes go through the
+    service-role client.
+
+    Args:
+        document_id: UUID of the document to delete.
+        user_id:     The authenticated user's UUID — the delete only
+                     succeeds if this user owns the document.
+
+    Returns:
+        True if a document row was deleted, False if no matching document
+        was found for this user (already gone, wrong ID, or not theirs).
+    """
+    client = _get_service_client()
+
+    # 1. Verify ownership before deleting anything
+    owned = (
+        client.table("documents")
+        .select("id")
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not owned.data:
+        return False
+
+    # 2. Delete dependent chunks first to avoid FK constraint violations
+    client.table("document_chunks").delete().eq("document_id", document_id).execute()
+
+    # 3. Delete dependent shares and comments too, so nothing orphans
+    client.table("document_shares").delete().eq("document_id", document_id).execute()
+    client.table("document_comments").delete().eq("document_id", document_id).execute()
+
+    # 4. Finally delete the document row itself
+    response = (
+        client.table("documents")
+        .delete()
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return bool(response.data)
 
 
 # ── Service-Role Client (bypasses RLS) ───────────────────────────────────────
@@ -402,7 +514,7 @@ def get_share_by_token(token: str) -> dict[str, Any] | None:
 
     response = (
         _get_service_client().table("document_shares")
-        .select("*, documents(id, file_name)")
+        .select("*, documents(id, file_name, summary)")
         .eq("share_token", token)
         .eq("is_active", True)
         .limit(1)

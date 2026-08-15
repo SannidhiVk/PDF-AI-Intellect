@@ -2,13 +2,13 @@
 
 import { useState, useCallback, useRef } from "react";
 import axios from "axios";
-import { UploadCloud, FileText, CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import { UploadCloud, FileText, CheckCircle2, XCircle, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
 
 const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
-type UploadStatus = "idle" | "uploading" | "processing" | "success" | "error";
+type UploadStatus = "idle" | "processing" | "success" | "error";
 
 interface PdfUploaderProps {
   onSuccess: (data: { document_id: string; summary: string; filename: string }) => void;
@@ -20,7 +20,6 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [progress, setProgress] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(
@@ -38,9 +37,8 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
       }
 
       setSelectedFile(file);
-      setStatus("uploading");
+      setStatus("processing");
       setErrorMessage(null);
-      setProgress(0);
 
       const formData = new FormData();
       formData.append("file", file);
@@ -57,7 +55,6 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
       }
 
       try {
-        setStatus("processing");
         const response = await axios.post(
           `${FASTAPI_URL}/api/process-pdf`,
           formData,
@@ -65,11 +62,6 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
             headers: {
               "Content-Type": "multipart/form-data",
               Authorization: `Bearer ${token}`,
-            },
-            onUploadProgress: (e) => {
-              if (e.total) {
-                setProgress(Math.round((e.loaded / e.total) * 100));
-              }
             },
             timeout: 120000, // 2 minutes for large PDFs
           }
@@ -121,11 +113,10 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
     setStatus("idle");
     setSelectedFile(null);
     setErrorMessage(null);
-    setProgress(0);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const isProcessing = status === "uploading" || status === "processing";
+  const isProcessing = status === "processing";
 
   return (
     <div className="w-full">
@@ -186,60 +177,27 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
           </div>
         )}
 
-        {/* Processing State */}
+        {/* Processing State — no internal details exposed */}
         {isProcessing && (
           <div className="flex flex-col items-center gap-5 text-center">
             <div className="relative flex h-20 w-20 items-center justify-center">
               <div className="absolute inset-0 rounded-full border-4 border-gray-800" />
               <div
-                className="absolute inset-0 rounded-full border-4 border-violet-500 border-t-transparent animate-spin"
-                style={{ animationDuration: "1s" }}
+                className="absolute inset-0 rounded-full border-4 border-transparent border-t-violet-500 border-r-violet-400/40 animate-spin"
+                style={{ animationDuration: "0.9s" }}
               />
-              <Loader2 className="h-8 w-8 text-violet-400 animate-spin" style={{ animationDuration: "2s" }} />
+              <Sparkles className="h-7 w-7 text-violet-400" />
             </div>
-
             <div>
-              <p className="text-base font-semibold text-gray-200">
-                {status === "uploading" ? "Uploading..." : "AI is analyzing your PDF..."}
-              </p>
-              <p className="mt-1 text-sm text-gray-500">
-                {status === "uploading"
-                  ? `${progress}% uploaded`
-                  : "Extracting text, generating embeddings & summary"}
-              </p>
+              <p className="text-base font-semibold text-gray-200">Working on it…</p>
+              <p className="mt-1 text-sm text-gray-500">This may take a moment</p>
             </div>
-
             {selectedFile && (
               <div className="flex items-center gap-2 rounded-lg bg-gray-800/50 px-4 py-2">
                 <FileText className="h-4 w-4 text-violet-400" />
                 <span className="max-w-xs truncate text-sm text-gray-300">{selectedFile.name}</span>
               </div>
             )}
-
-            {/* Processing steps indicator */}
-            <div className="flex gap-2">
-              {["Extract", "Chunk", "Embed", "Summarize"].map((step, i) => (
-                <div
-                  key={step}
-                  className="flex flex-col items-center gap-1"
-                  style={{ animationDelay: `${i * 0.5}s` }}
-                >
-                  <div
-                    className="h-1.5 w-12 rounded-full bg-gray-800 overflow-hidden"
-                  >
-                    <div
-                      className="h-full rounded-full bg-violet-500 animate-pulse"
-                      style={{
-                        width: "100%",
-                        animationDelay: `${i * 0.3}s`,
-                        opacity: 0.4 + i * 0.2,
-                      }}
-                    />
-                  </div>
-                  <span className="text-xs text-gray-600">{step}</span>
-                </div>
-              ))}
-            </div>
           </div>
         )}
 

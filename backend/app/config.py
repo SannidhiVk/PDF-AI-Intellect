@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     Pydantic validates types automatically at startup.
     """
 
-    # Google Gemini
-    gemini_api_key: str
+    # Groq Cloud LLM
+    groq_api_key: str
 
     # Supabase
     supabase_url: str

@@ -45,9 +45,15 @@ export default function DashboardPage() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) return;
-      const data: Array<{ id: string; file_name: string; created_at: string }> = await res.json();
-      setDocuments(
-        data.map((d) => ({
+      const data: Array<{ id: string; file_name: string; created_at: string; summary?: string | null }> = await res.json();
+      setDocuments((prev) => {
+        // Build a lookup of existing summaries so a just-uploaded doc's
+        // freshly-generated summary is not lost if the DB hasn't persisted
+        // yet when this refetch fires.
+        const existingSummaries: Record<string, string> = {};
+        prev.forEach((d) => { if (d.summary) existingSummaries[d.id] = d.summary; });
+
+        return data.map((d) => ({
           id: d.id,
           filename: d.file_name,
           // ISO timestamp → readable time (e.g. "14:32")
@@ -55,9 +61,10 @@ export default function DashboardPage() {
             hour: "2-digit",
             minute: "2-digit",
           }),
-          summary: "", // summary not stored server-side yet; empty on restore
-        }))
-      );
+          // Prefer: DB summary → existing in-memory summary → empty string
+          summary: d.summary ?? existingSummaries[d.id] ?? "",
+        }));
+      });
     } catch {
       // Non-fatal: sidebar will just be empty until next upload
     } finally {
@@ -114,6 +121,27 @@ export default function DashboardPage() {
     [authToken, fetchDocuments]
   );
 
+  const handleDeleteDocument = useCallback(
+    async (id: string) => {
+      if (!authToken) return;
+      try {
+        const res = await fetch(`${FASTAPI_URL}/api/documents/${id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!res.ok) return; // silently ignore — doc stays in sidebar
+      } catch {
+        return; // network error — leave the list unchanged
+      }
+      // Remove from local state immediately (no need to refetch)
+      setDocuments((prev) => prev.filter((d) => d.id !== id));
+      // If the deleted doc was selected, clear the selection
+      setSelectedDocId((prev) => (prev === id ? null : prev));
+      setShowSummary((prev) => (selectedDocId === id ? false : prev));
+    },
+    [authToken, selectedDocId]
+  );
+
   // Show full-screen spinner while session is being resolved.
   // This early return now happens AFTER all hooks are called, so hook
   // order/count stays identical across the loading -> authenticated transition.
@@ -146,6 +174,7 @@ export default function DashboardPage() {
           uploadedAt: d.uploadedAt,
         }))}
         onSelectHistory={handleSelectHistory}
+        onDeleteDocument={handleDeleteDocument}
         selectedDocumentId={selectedDocId}
         userEmail={user.email ?? ""}
         isLoadingHistory={isFetchingDocs}
@@ -259,15 +288,26 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
             </div>
             <div>
               <h2 className="text-xl font-semibold text-white">
-                Analyze Any PDF with AI
+                Chat with any PDF — instantly
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-gray-400">
-                Upload your document below. Our AI will extract the text, chunk it intelligently,
-                generate vector embeddings, and produce a comprehensive summary — all in seconds.
+                Upload a document and ask questions in plain English. Get accurate answers,
+                key highlights, and a full summary — no technical knowledge needed.
               </p>
               <div className="mt-4 flex flex-wrap gap-3">
-                {["Auto Summary", "Semantic Search", "RAG Chat", "Multi-doc History"].map((feat) => (
-                  <FeaturePill key={feat} label={feat} />
+                {[
+                  { icon: "📄", label: "Instant summary" },
+                  { icon: "💬", label: "Ask anything" },
+                  { icon: "🔍", label: "Find key info fast" },
+                  { icon: "📚", label: "Multiple documents" },
+                ].map(({ icon, label }) => (
+                  <span
+                    key={label}
+                    className="flex items-center gap-1.5 rounded-full bg-gray-800/60 border border-gray-700/50 px-3 py-1 text-xs font-medium text-gray-400"
+                  >
+                    <span>{icon}</span>
+                    {label}
+                  </span>
                 ))}
               </div>
             </div>
@@ -315,14 +355,6 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
   );
 }
 
-function FeaturePill({ label }: { label: string }) {
-  return (
-    <span className="flex items-center gap-1.5 rounded-full bg-gray-800/60 border border-gray-700/50 px-3 py-1 text-xs font-medium text-gray-400">
-      <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />
-      {label}
-    </span>
-  );
-}
 
 function TabButton({
   icon,

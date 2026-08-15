@@ -10,7 +10,7 @@
 
 import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { Brain, Mail, Lock, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
+import { Brain, Mail, Lock, User, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 
 type AuthMode = "signin" | "signup";
@@ -18,6 +18,7 @@ type AuthMode = "signin" | "signup";
 export default function AuthPage() {
   const router = useRouter();
   const [mode, setMode] = useState<AuthMode>("signin");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -31,7 +32,13 @@ export default function AuthPage() {
 
     try {
       if (mode === "signup") {
-        const { error } = await supabase.auth.signUp({ email, password });
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: { full_name: name.trim() || email.split("@")[0] },
+          },
+        });
         if (error) throw error;
         setEmailSent(true);
       } else {
@@ -118,6 +125,28 @@ export default function AuthPage() {
 
           {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-4" id="auth-form">
+            {/* Name — only shown during signup */}
+            {mode === "signup" && (
+              <div>
+                <label htmlFor="auth-name" className="block mb-1.5 text-xs font-medium text-gray-400">
+                  Full name
+                </label>
+                <div className="relative">
+                  <User className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-600" />
+                  <input
+                    id="auth-name"
+                    type="text"
+                    required
+                    autoComplete="name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Jane Smith"
+                    className="w-full rounded-lg border border-gray-700 bg-gray-800/60 pl-10 pr-4 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600/50 transition-colors"
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Email */}
             <div>
               <label htmlFor="auth-email" className="block mb-1.5 text-xs font-medium text-gray-400">

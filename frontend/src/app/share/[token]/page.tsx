@@ -38,6 +38,7 @@ type Tab = "summary" | "chat" | "comments";
 interface ShareInfo {
   document_id: string;
   file_name: string;
+  summary: string | null;
 }
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
@@ -143,7 +144,11 @@ export default function SharePage() {
       {/* Content */}
       <main className="mx-auto max-w-3xl px-4 py-8">
         {activeTab === "summary" && (
-          <PublicSummaryView token={token} filename={shareInfo.file_name} />
+          <PublicSummaryView
+            token={token}
+            filename={shareInfo.file_name}
+            summary={shareInfo.summary}
+          />
         )}
 
         {activeTab === "chat" && (
@@ -167,31 +172,17 @@ export default function SharePage() {
 }
 
 // ── Public Summary View ───────────────────────────────────────────────────────
-// Fetches and displays the document summary. Currently fetches from the share
-// info; in a future phase store the summary text in the documents table so
-// it can be fetched here directly.
+// Displays the AI-generated summary fetched from /api/share/{token}.
 
-function PublicSummaryView({ token, filename }: { token: string; filename: string }) {
-  const [summary, setSummary] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    // The share info endpoint returns only metadata. We display a placeholder
-    // until you wire up summary storage in the documents table (Phase 3).
-    // For now we show the document name and a helpful message.
-    setLoading(false);
-    setSummary(null);
-  }, [token]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-gray-500 py-8">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Loading summary…
-      </div>
-    );
-  }
-
+function PublicSummaryView({
+  token,
+  filename,
+  summary,
+}: {
+  token: string;
+  filename: string;
+  summary: string | null;
+}) {
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
       {/* Document card */}
@@ -225,7 +216,7 @@ function PublicSummaryView({ token, filename }: { token: string; filename: strin
         </div>
       </div>
 
-      {/* Summary placeholder */}
+      {/* Summary panel */}
       <div className="rounded-2xl border border-gray-800/60 bg-gray-900/60 backdrop-blur-sm overflow-hidden">
         <div className="flex items-center gap-3 px-6 py-4 border-b border-gray-800/60">
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-amber-600 to-orange-600 shadow-lg shadow-amber-900/20">
@@ -236,12 +227,20 @@ function PublicSummaryView({ token, filename }: { token: string; filename: strin
             <p className="text-xs text-gray-500 truncate max-w-xs">{filename}</p>
           </div>
         </div>
-        <div className="px-6 py-8 text-center">
-          <BookOpen className="h-8 w-8 text-gray-700 mx-auto mb-3" />
-          <p className="text-sm text-gray-400">
-            Summary display coming soon. Use the <strong className="text-gray-300">Chat</strong> tab to ask the AI to
-            summarise this document for you.
-          </p>
+        <div className="px-6 py-6">
+          {summary ? (
+            <div className="prose prose-invert prose-sm max-w-none prose-headings:text-white prose-p:text-gray-300 prose-strong:text-white prose-li:text-gray-300 prose-hr:border-gray-800">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{summary}</ReactMarkdown>
+            </div>
+          ) : (
+            <div className="text-center py-4">
+              <BookOpen className="h-8 w-8 text-gray-700 mx-auto mb-3" />
+              <p className="text-sm text-gray-400">
+                No summary available. Use the <strong className="text-gray-300">Chat</strong> tab to ask the AI to
+                summarise this document for you.
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>
