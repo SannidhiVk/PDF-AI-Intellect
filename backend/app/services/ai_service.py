@@ -8,7 +8,7 @@ Requires:
   1. Ollama installed and running locally: https://ollama.com/download
   2. Models pulled once via terminal:
          ollama pull nomic-embed-text
-         ollama pull llama3.1
+         ollama pull llama3.2:3b
   3. `pip install ollama` (see requirements.txt)
 
 Responsibilities:
@@ -39,6 +39,42 @@ CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 
 # nomic-embed-text outputs 768-dim vectors — matches Supabase pgvector(768)
 EMBEDDING_DIMENSION = 768
+
+# ── Context window cap ──────────────────────────────────────────────────────
+# Ollama's default num_ctx (2048-4096 tokens depending on model) is fine for
+# short chats, but our summary/RAG prompts can run much longer (full chunks
+# of document text). Without an EXPLICIT num_ctx, Ollama silently grows the
+# KV-cache buffer to fit whatever prompt it's given — on CPU-only inference
+# with limited RAM, that dynamic reallocation is what was causing:
+#   "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer"
+# Setting a fixed, deliberate ceiling here trades "handles huge docs
+# perfectly" for "never blows up RAM mid-request" — a fair tradeoff for a
+# local/CPU deployment. Raise this only if you've confirmed you have the
+# RAM headroom (rule of thumb: ~1.5-2GB extra per 4096 ctx tokens on a 3B
+# model, CPU-only).
+CHAT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "4096"))
+
+
+def _unload_model(model: str) -> None:
+    """
+    Force Ollama to unload a model from memory immediately, instead of
+    waiting for the default 5-minute keep_alive timeout.
+
+    On low-RAM machines (4-8GB total), leaving the embedding model
+    (nomic-embed-text) resident while the chat model (llama3.2:3b) tries
+    to load -- or vice versa -- is exactly what causes:
+      "failed to allocate CPU buffer" / "failed to allocate compute pp buffers"
+    This is called right after each embedding/chat operation completes so
+    at most ONE model is ever resident in RAM at a time. Trades a few
+    seconds of reload latency per request for not crashing.
+    """
+    try:
+        _client.generate(model=model, prompt="", keep_alive=0)
+    except Exception:
+        # Non-fatal: if the unload call itself fails, the model just stays
+        # loaded until its normal keep_alive timeout expires. Don't let a
+        # failed cleanup step mask the actual result of the operation.
+        pass
 
 
 def _friendly_connection_error(exc: Exception) -> RuntimeError:
@@ -87,13 +123,21 @@ def generate_embeddings_batch(chunks: list[str]) -> list[list[float]]:
     """
     Generate embeddings for a list of text chunks sequentially.
 
+    The embedding model stays loaded across the whole batch (fast — no
+    reload per chunk), then is explicitly unloaded once ALL chunks are
+    done. This frees RAM before generate_summary() tries to load the chat
+    model right afterward — important on low-RAM (4-8GB) machines where
+    both models resident at once can exceed available memory.
+
     Args:
         chunks: List of text strings to embed.
 
     Returns:
         A list of embedding vectors, one per input chunk.
     """
-    return [generate_embedding(chunk) for chunk in chunks]
+    embeddings = [generate_embedding(chunk) for chunk in chunks]
+    _unload_model(EMBEDDING_MODEL)
+    return embeddings
 
 
 def generate_query_embedding(query: str) -> list[float]:
@@ -115,6 +159,10 @@ def generate_query_embedding(query: str) -> list[float]:
     except Exception as exc:
         raise _friendly_connection_error(exc) from exc
 
+    # Free RAM immediately -- generate_rag_answer() is called right after
+    # this in the /chat flow and needs to load the (larger) chat model.
+    _unload_model(EMBEDDING_MODEL)
+
     return response["embedding"]
 
 
@@ -131,10 +179,12 @@ _SUMMARY_SYSTEM_PROMPT = textwrap.dedent("""\
       or general facts about the topic — even if you "know" more about it.
     - Do not infer facts, numbers, dates, or names that are not stated
       verbatim or near-verbatim in the text.
-    - If the extracted text is fragmented, garbled, or clearly incomplete
-      (e.g. from OCR/PDF extraction artifacts), summarise only what is
-      legible and add one line under "Extraction Notes" flagging this —
-      omit that section entirely if the text is clean.
+    - Never comment on, evaluate, or mention the quality/completeness of the
+      text extraction itself (e.g. do not write things like "the text is
+      verbatim", "extraction notes", "this appears to be OCR output", etc.).
+      That is not your job — just summarise whatever legible content is
+      present and ignore illegible fragments silently. Extraction quality
+      is assessed separately outside this prompt.
     - If the document is too short or sparse to support a section below
       (e.g. no clear insights beyond the overview), write "Not enough
       content in the document to determine this" for that section instead
@@ -199,13 +249,19 @@ def generate_summary(text: str) -> str:
     Returns:
         A markdown-formatted summary string.
     """
-    was_truncated = len(text) > 30_000
-    truncated_text = text[:30_000] if was_truncated else text
+    # ~10,000 chars (~2,500 tokens) leaves comfortable headroom under
+    # CHAT_NUM_CTX (4096) once the system prompt + generated summary tokens
+    # are accounted for. The old 30,000-char ceiling (~7,500+ tokens) was
+    # forcing Ollama to grow its KV-cache buffer well past what a CPU-only
+    # 3B setup could reliably allocate.
+    MAX_SUMMARY_INPUT_CHARS = 10_000
+    was_truncated = len(text) > MAX_SUMMARY_INPUT_CHARS
+    truncated_text = text[:MAX_SUMMARY_INPUT_CHARS] if was_truncated else text
 
     truncation_note = (
-        "\n\nNOTE: This is only the first ~30,000 characters of a longer "
-        "document. Summarise faithfully based on this excerpt alone — do "
-        "not claim to cover the full document."
+        f"\n\nNOTE: This is only the first ~{MAX_SUMMARY_INPUT_CHARS:,} "
+        "characters of a longer document. Summarise faithfully based on "
+        "this excerpt alone — do not claim to cover the full document."
         if was_truncated
         else ""
     )
@@ -223,9 +279,14 @@ def generate_summary(text: str) -> str:
                     ),
                 },
             ],
+            options={"num_ctx": CHAT_NUM_CTX},
         )
     except Exception as exc:
         raise _friendly_connection_error(exc) from exc
+
+    # Free RAM immediately -- avoids this model still being resident when
+    # the NEXT PDF upload's embedding step tries to load nomic-embed-text.
+    _unload_model(CHAT_MODEL)
 
     return response["message"]["content"].strip()
 
@@ -312,8 +373,14 @@ def generate_rag_answer(
                 {"role": "system", "content": _RAG_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
+            options={"num_ctx": CHAT_NUM_CTX},
         )
     except Exception as exc:
         raise _friendly_connection_error(exc) from exc
+
+    # Free RAM immediately -- avoids this model still being resident when
+    # the next request (embedding for a new upload, or another chat query)
+    # tries to load a model of its own.
+    _unload_model(CHAT_MODEL)
 
     return response["message"]["content"].strip()

@@ -4,6 +4,7 @@ import { useState, useCallback, useRef } from "react";
 import axios from "axios";
 import { UploadCloud, FileText, CheckCircle2, XCircle, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { supabase } from "@/lib/supabaseClient";
 
 const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
@@ -11,9 +12,10 @@ type UploadStatus = "idle" | "uploading" | "processing" | "success" | "error";
 
 interface PdfUploaderProps {
   onSuccess: (data: { document_id: string; summary: string; filename: string }) => void;
+  userId: string;
 }
 
-export default function PdfUploader({ onSuccess }: PdfUploaderProps) {
+export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
   const [status, setStatus] = useState<UploadStatus>("idle");
   const [isDragOver, setIsDragOver] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -42,8 +44,17 @@ export default function PdfUploader({ onSuccess }: PdfUploaderProps) {
 
       const formData = new FormData();
       formData.append("file", file);
-      // Path A: hardcoded placeholder until real Supabase Auth is implemented
-      formData.append("user_id", "00000000-0000-0000-0000-000000000000");
+      // user_id is NO LONGER sent from the client.
+      // The backend extracts it from the verified JWT in the Authorization header.
+
+      // Fetch the current session token
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      if (!token) {
+        setErrorMessage("You are not signed in. Please refresh and sign in again.");
+        setStatus("error");
+        return;
+      }
 
       try {
         setStatus("processing");
@@ -51,7 +62,10 @@ export default function PdfUploader({ onSuccess }: PdfUploaderProps) {
           `${FASTAPI_URL}/api/process-pdf`,
           formData,
           {
-            headers: { "Content-Type": "multipart/form-data" },
+            headers: {
+              "Content-Type": "multipart/form-data",
+              Authorization: `Bearer ${token}`,
+            },
             onUploadProgress: (e) => {
               if (e.total) {
                 setProgress(Math.round((e.loaded / e.total) * 100));

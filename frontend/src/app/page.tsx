@@ -1,12 +1,14 @@
 "use client";
 
-import { useState, useCallback } from "react";
-import { FileText, Sparkles, MessageSquare, UploadCloud, ArrowRight } from "lucide-react";
+import { useState, useCallback, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { FileText, Sparkles, MessageSquare, UploadCloud, ArrowRight, Loader2 } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import PdfUploader from "@/components/PdfUploader";
 import SummaryView from "@/components/SummaryView";
 import ChatWindow from "@/components/ChatWindow";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/lib/AuthContext";
 
 interface UploadedDocument {
   id: string;
@@ -18,14 +20,22 @@ interface UploadedDocument {
 type ActiveView = "upload" | "chat";
 
 export default function DashboardPage() {
+  const router = useRouter();
+  const { user, loading } = useAuth();
   const [activeView, setActiveView] = useState<ActiveView>("upload");
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
 
-  // Get the currently selected document
-  const selectedDocument = documents.find((d) => d.id === selectedDocId) ?? null;
+  // Redirect to /auth if not authenticated
+  useEffect(() => {
+    if (!loading && !user) {
+      router.replace("/auth");
+    }
+  }, [loading, user, router]);
 
+  // ── All hooks MUST be declared unconditionally, before any early return ──
+  // (moved up from below the loading/user guard to fix "change in order of Hooks")
   const handleUploadSuccess = useCallback(
     (data: { document_id: string; summary: string; filename: string }) => {
       const now = new Date();
@@ -45,6 +55,21 @@ export default function DashboardPage() {
     []
   );
 
+  // Show full-screen spinner while session is being resolved.
+  // This early return now happens AFTER all hooks are called, so hook
+  // order/count stays identical across the loading -> authenticated transition.
+  if (loading || !user) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-950">
+        <Loader2 className="h-8 w-8 animate-spin text-violet-500" />
+      </div>
+    );
+  }
+
+  // Get the currently selected document (plain derived value, not a hook —
+  // safe to compute after the guard)
+  const selectedDocument = documents.find((d) => d.id === selectedDocId) ?? null;
+
   const handleSelectHistory = (id: string) => {
     setSelectedDocId(id);
     setShowSummary(true);
@@ -63,6 +88,7 @@ export default function DashboardPage() {
         }))}
         onSelectHistory={handleSelectHistory}
         selectedDocumentId={selectedDocId}
+        userEmail={user.email ?? ""}
       />
 
       {/* Main Content */}
@@ -110,6 +136,7 @@ export default function DashboardPage() {
               selectedDocument={selectedDocument}
               showSummary={showSummary}
               onGoToChat={() => setActiveView("chat")}
+              userId={user.id}
             />
           )}
 
@@ -149,9 +176,10 @@ interface UploadViewProps {
   selectedDocument: UploadedDocument | null;
   showSummary: boolean;
   onGoToChat: () => void;
+  userId: string;
 }
 
-function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat }: UploadViewProps) {
+function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId }: UploadViewProps) {
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       {/* Welcome banner — only shown when no document uploaded */}
@@ -184,7 +212,7 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat }: Up
       )}
 
       {/* Uploader */}
-      <PdfUploader onSuccess={onSuccess} />
+      <PdfUploader onSuccess={onSuccess} userId={userId} />
 
       {/* Summary — shown after upload */}
       {showSummary && selectedDocument && (

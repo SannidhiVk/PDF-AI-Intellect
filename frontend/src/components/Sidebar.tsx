@@ -1,7 +1,9 @@
 "use client";
 
-import { FileText, MessageSquare, History, Settings, LogOut, Brain, ChevronRight } from "lucide-react";
+import { FileText, MessageSquare, History, LogOut, Brain, ChevronRight, User } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { supabase } from "@/lib/supabaseClient";
 
 interface SidebarProps {
   activeView: "upload" | "chat";
@@ -9,6 +11,7 @@ interface SidebarProps {
   uploadHistory: { id: string; filename: string; uploadedAt: string }[];
   onSelectHistory: (id: string) => void;
   selectedDocumentId: string | null;
+  userEmail: string;
 }
 
 export default function Sidebar({
@@ -17,7 +20,15 @@ export default function Sidebar({
   uploadHistory,
   onSelectHistory,
   selectedDocumentId,
+  userEmail,
 }: SidebarProps) {
+  const router = useRouter();
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    router.replace("/auth");
+  };
+
   return (
     <aside className="flex h-screen w-64 flex-shrink-0 flex-col bg-gray-950 border-r border-gray-800/60">
       {/* Logo */}
@@ -93,19 +104,24 @@ export default function Sidebar({
         )}
       </div>
 
-      {/* Footer */}
+      {/* Footer — user info + sign out */}
       <div className="border-t border-gray-800/60 p-3 space-y-1">
-        <NavButton
-          icon={<Settings className="h-4 w-4" />}
-          label="Settings"
-          active={false}
-          onClick={() => {}}
-        />
+        {/* User email strip */}
+        {userEmail && (
+          <div className="flex items-center gap-2.5 rounded-lg px-3 py-2 mb-1">
+            <div className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-violet-700 to-indigo-700">
+              <User className="h-3.5 w-3.5 text-white" />
+            </div>
+            <p className="truncate text-xs text-gray-500" title={userEmail}>
+              {userEmail}
+            </p>
+          </div>
+        )}
         <NavButton
           icon={<LogOut className="h-4 w-4" />}
           label="Sign Out"
           active={false}
-          onClick={() => {}}
+          onClick={handleSignOut}
           danger
         />
       </div>
@@ -144,3 +160,4 @@ function NavButton({ icon, label, active, onClick, disabled, danger, tooltip }: 
     </button>
   );
 }
+
