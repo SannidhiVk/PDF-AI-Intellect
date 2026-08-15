@@ -121,3 +121,110 @@ AS $$
     ORDER BY dc.embedding <=> query_embedding  -- ascending distance = descending similarity
     LIMIT match_count;
 $$;
+
+
+-- ─────────────────────────────────────────────
+-- STEP 5: Create the `document_shares` table
+-- ─────────────────────────────────────────────
+-- Each row represents a unique shareable link for one document.
+-- share_token is a random UUID used directly in the URL: /share/<share_token>
+-- Setting is_active = FALSE effectively revokes the link without deleting it.
+CREATE TABLE IF NOT EXISTS document_shares (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    share_token UUID        NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    created_by  UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_shares_document_id ON document_shares(document_id);
+CREATE INDEX IF NOT EXISTS idx_shares_token       ON document_shares(share_token);
+
+-- RLS: authenticated owners can manage their own share links.
+-- Public (token-validated) reads are done server-side with the service-role key,
+-- so they bypass RLS entirely — no anon SELECT policy needed.
+ALTER TABLE document_shares ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Owners can manage their share links"
+    ON document_shares FOR ALL
+    USING (auth.uid() = created_by)
+    WITH CHECK (auth.uid() = created_by);
+
+CREATE POLICY "Anyone can view active share links"
+    ON document_shares FOR SELECT
+    USING (is_active = true);
+
+
+-- ─────────────────────────────────────────────
+-- STEP 6: Create the `document_comments` table
+-- ─────────────────────────────────────────────
+-- Stores comments and one-level replies on a document.
+-- parent_id = NULL  → top-level comment
+-- parent_id = <id>  → reply to that comment (one level deep)
+-- user_id = NULL    → guest commenter (no Supabase account)
+-- author_name       → display name (always set; pulled from profile for auth users)
+CREATE TABLE IF NOT EXISTS document_comments (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    parent_id   UUID        REFERENCES document_comments(id) ON DELETE CASCADE,
+    user_id     UUID        REFERENCES auth.users(id) ON DELETE SET NULL,
+    author_name TEXT        NOT NULL DEFAULT 'Anonymous',
+    content     TEXT        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_document_id ON document_comments(document_id);
+CREATE INDEX IF NOT EXISTS idx_comments_parent_id   ON document_comments(parent_id);
+
+-- RLS: The document owner can SELECT all comments on their docs.
+-- Anyone can view / post comments on documents with active share links.
+ALTER TABLE document_comments ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Document owner can view all comments"
+    ON document_comments FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM documents d
+            WHERE d.id = document_comments.document_id
+              AND d.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Anyone can view comments on active shared documents"
+    ON document_comments FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM document_shares s
+            WHERE s.document_id = document_comments.document_id
+              AND s.is_active = true
+        )
+    );
+
+CREATE POLICY "Authenticated users can post comments"
+    ON document_comments FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Anyone can post comments on active shared documents"
+    ON document_comments FOR INSERT
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM document_shares s
+            WHERE s.document_id = document_comments.document_id
+              AND s.is_active = true
+        )
+    );
+
+CREATE POLICY "Users can delete their own comments"
+    ON document_comments FOR DELETE
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Document owner can delete any comment"
+    ON document_comments FOR DELETE
+    USING (
+        EXISTS (
+            SELECT 1 FROM documents d
+            WHERE d.id = document_comments.document_id
+              AND d.user_id = auth.uid()
+        )
+    );

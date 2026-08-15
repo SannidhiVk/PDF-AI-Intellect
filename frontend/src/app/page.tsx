@@ -7,8 +7,13 @@ import Sidebar from "@/components/Sidebar";
 import PdfUploader from "@/components/PdfUploader";
 import SummaryView from "@/components/SummaryView";
 import ChatWindow from "@/components/ChatWindow";
+import CommentSection from "@/components/CommentSection";
+import ShareControls from "@/components/ShareControls";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/AuthContext";
+import { supabase } from "@/lib/supabaseClient";
+
+const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
 interface UploadedDocument {
   id: string;
@@ -26,6 +31,61 @@ export default function DashboardPage() {
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [isFetchingDocs, setIsFetchingDocs] = useState(false);
+
+  /**
+   * Fetch the user's document history from the backend.
+   * Called on mount (to restore sidebar after refresh) and after each upload.
+   * Uses the JWT so the backend can scope results to this user only.
+   */
+  const fetchDocuments = useCallback(async (token: string) => {
+    setIsFetchingDocs(true);
+    try {
+      const res = await fetch(`${FASTAPI_URL}/api/documents`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data: Array<{ id: string; file_name: string; created_at: string; summary?: string | null }> = await res.json();
+      setDocuments((prev) => {
+        // Build a lookup of existing summaries so a just-uploaded doc's
+        // freshly-generated summary is not lost if the DB hasn't persisted
+        // yet when this refetch fires.
+        const existingSummaries: Record<string, string> = {};
+        prev.forEach((d) => { if (d.summary) existingSummaries[d.id] = d.summary; });
+
+        return data.map((d) => ({
+          id: d.id,
+          filename: d.file_name,
+          // ISO timestamp → readable time (e.g. "14:32")
+          uploadedAt: new Date(d.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          // Prefer: DB summary → existing in-memory summary → empty string
+          summary: d.summary ?? existingSummaries[d.id] ?? "",
+        }));
+      });
+    } catch {
+      // Non-fatal: sidebar will just be empty until next upload
+    } finally {
+      setIsFetchingDocs(false);
+    }
+  }, []);
+
+  // Keep the access token fresh for Share/Comment calls
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      const token = session?.access_token ?? null;
+      setAuthToken(token);
+      // Restore sidebar history from the API now that we have a token
+      if (token) fetchDocuments(token);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => setAuthToken(session?.access_token ?? null)
+    );
+    return () => subscription.unsubscribe();
+  }, [fetchDocuments]);
 
   // Redirect to /auth if not authenticated
   useEffect(() => {
@@ -48,11 +108,39 @@ export default function DashboardPage() {
         uploadedAt: formatted,
       };
 
-      setDocuments((prev) => [newDoc, ...prev]);
+      // Prepend the new upload and deduplicate (id is the key)
+      setDocuments((prev) => {
+        const without = prev.filter((d) => d.id !== newDoc.id);
+        return [newDoc, ...without];
+      });
       setSelectedDocId(newDoc.id);
       setShowSummary(true);
+
+      // Refresh the full list so the sidebar stays consistent with the DB
+      if (authToken) fetchDocuments(authToken);
     },
-    []
+    [authToken, fetchDocuments]
+  );
+
+  const handleDeleteDocument = useCallback(
+    async (id: string) => {
+      if (!authToken) return;
+      try {
+        const res = await fetch(`${FASTAPI_URL}/api/documents/${id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!res.ok) return; // silently ignore — doc stays in sidebar
+      } catch {
+        return; // network error — leave the list unchanged
+      }
+      // Remove from local state immediately (no need to refetch)
+      setDocuments((prev) => prev.filter((d) => d.id !== id));
+      // If the deleted doc was selected, clear the selection
+      setSelectedDocId((prev) => (prev === id ? null : prev));
+      setShowSummary((prev) => (selectedDocId === id ? false : prev));
+    },
+    [authToken, selectedDocId]
   );
 
   // Show full-screen spinner while session is being resolved.
@@ -87,19 +175,21 @@ export default function DashboardPage() {
           uploadedAt: d.uploadedAt,
         }))}
         onSelectHistory={handleSelectHistory}
+        onDeleteDocument={handleDeleteDocument}
         selectedDocumentId={selectedDocId}
         userEmail={user.email ?? ""}
+        isLoadingHistory={isFetchingDocs}
       />
 
       {/* Main Content */}
       <main className="flex flex-1 flex-col min-w-0 overflow-hidden">
         {/* Top bar */}
-        <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800/60 flex-shrink-0">
-          <div>
+        <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800/60 flex-shrink-0 gap-4">
+          <div className="min-w-0">
             <h1 className="text-lg font-semibold text-white">
               {activeView === "upload" ? "Document Analysis" : "Document Chat"}
             </h1>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs text-gray-500 truncate">
               {activeView === "upload"
                 ? "Upload a PDF to extract insights and AI summaries"
                 : selectedDocument
@@ -108,8 +198,19 @@ export default function DashboardPage() {
             </p>
           </div>
 
+          {/* Share controls — visible whenever a document is selected */}
+          {selectedDocId && authToken && (
+            <div className="flex-shrink-0">
+              <ShareControls
+                key={selectedDocId}
+                documentId={selectedDocId}
+                authToken={authToken}
+              />
+            </div>
+          )}
+
           {/* View toggle tabs */}
-          <div className="flex items-center gap-1 rounded-xl bg-gray-900 border border-gray-800 p-1">
+          <div className="flex items-center gap-1 rounded-xl bg-gray-900 border border-gray-800 p-1 flex-shrink-0">
             <TabButton
               icon={<UploadCloud className="h-3.5 w-3.5" />}
               label="Analyze"
@@ -137,6 +238,8 @@ export default function DashboardPage() {
               showSummary={showSummary}
               onGoToChat={() => setActiveView("chat")}
               userId={user.id}
+              authToken={authToken}
+              ownerName={user.email ?? "You"}
             />
           )}
 
@@ -177,9 +280,11 @@ interface UploadViewProps {
   showSummary: boolean;
   onGoToChat: () => void;
   userId: string;
+  authToken: string | null;
+  ownerName: string;
 }
 
-function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId }: UploadViewProps) {
+function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId, authToken, ownerName }: UploadViewProps) {
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       {/* Welcome banner — only shown when no document uploaded */}
@@ -195,15 +300,26 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
             </div>
             <div>
               <h2 className="text-xl font-semibold text-white">
-                Analyze Any PDF with AI
+                Chat with any PDF — instantly
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-gray-400">
-                Upload your document below. Our AI will extract the text, chunk it intelligently,
-                generate vector embeddings, and produce a comprehensive summary — all in seconds.
+                Upload a document and ask questions in plain English. Get accurate answers,
+                key highlights, and a full summary — no technical knowledge needed.
               </p>
               <div className="mt-4 flex flex-wrap gap-3">
-                {["Auto Summary", "Semantic Search", "RAG Chat", "Multi-doc History"].map((feat) => (
-                  <FeaturePill key={feat} label={feat} />
+                {[
+                  { icon: "📄", label: "Instant summary" },
+                  { icon: "💬", label: "Ask anything" },
+                  { icon: "🔍", label: "Find key info fast" },
+                  { icon: "📚", label: "Multiple documents" },
+                ].map(({ icon, label }) => (
+                  <span
+                    key={label}
+                    className="flex items-center gap-1.5 rounded-full bg-gray-800/60 border border-gray-700/50 px-3 py-1 text-xs font-medium text-gray-400"
+                  >
+                    <span>{icon}</span>
+                    {label}
+                  </span>
                 ))}
               </div>
             </div>
@@ -220,6 +336,15 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
           <SummaryView
             summary={selectedDocument.summary}
             filename={selectedDocument.filename}
+          />
+
+          {/* Comments — owner view */}
+          <CommentSection
+            mode="owner"
+            documentId={selectedDocument.id}
+            authToken={authToken ?? undefined}
+            currentUserName={ownerName}
+            defaultCollapsed
           />
 
           {/* CTA to chat */}
@@ -240,14 +365,6 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
   );
 }
 
-function FeaturePill({ label }: { label: string }) {
-  return (
-    <span className="flex items-center gap-1.5 rounded-full bg-gray-800/60 border border-gray-700/50 px-3 py-1 text-xs font-medium text-gray-400">
-      <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />
-      {label}
-    </span>
-  );
-}
 
 function TabButton({
   icon,

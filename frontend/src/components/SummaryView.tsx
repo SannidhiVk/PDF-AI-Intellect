@@ -3,7 +3,13 @@
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FileText, ChevronDown, ChevronUp, BookOpen, Sparkles } from "lucide-react";
+import {
+  FileText,
+  ChevronDown,
+  ChevronUp,
+  BookOpen,
+  Sparkles,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface SummaryViewProps {
@@ -40,28 +46,23 @@ export default function SummaryView({ summary, filename }: SummaryViewProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {/* Metadata badges */}
           <div className="hidden sm:flex items-center gap-2">
             <Badge icon={<BookOpen className="h-3 w-3" />} label={`${wordCount} words`} />
             <Badge icon={<FileText className="h-3 w-3" />} label={`~${readingTime} min read`} />
           </div>
 
+          {/* Expand / Collapse */}
           <button
             onClick={() => setIsExpanded(!isExpanded)}
             className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-gray-400 hover:bg-gray-800 hover:text-gray-200 transition-all duration-150"
             aria-label={isExpanded ? "Collapse summary" : "Expand summary"}
           >
             {isExpanded ? (
-              <>
-                <ChevronUp className="h-3.5 w-3.5" />
-                Collapse
-              </>
+              <><ChevronUp className="h-3.5 w-3.5" />Collapse</>
             ) : (
-              <>
-                <ChevronDown className="h-3.5 w-3.5" />
-                Expand
-              </>
+              <><ChevronDown className="h-3.5 w-3.5" />Expand</>
             )}
           </button>
         </div>
@@ -88,9 +89,7 @@ export default function SummaryView({ summary, filename }: SummaryViewProps) {
                 "prose-h3:text-sm prose-h3:mt-3 prose-h3:mb-1"
               )}
             >
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {summary}
-              </ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{summary}</ReactMarkdown>
             </div>
           ) : (
             <p className="text-sm text-gray-500">No summary available.</p>

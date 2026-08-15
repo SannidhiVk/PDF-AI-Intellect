@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
-import { Send, Bot, User, Loader2, AlertCircle, Trash2, MessageSquare } from "lucide-react";
+import { Send, Bot, User, AlertCircle, Trash2, MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -17,11 +17,13 @@ export interface Message {
 }
 
 interface ChatWindowProps {
-  documentId: string;
+  documentId?: string;
   filename: string;
+  /** When provided, chats via the public /api/share/{token}/chat endpoint (no auth). */
+  shareToken?: string;
 }
 
-export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
+export default function ChatWindow({ documentId, filename, shareToken }: ChatWindowProps) {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -69,22 +71,27 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
         .filter((m) => m.id !== "welcome" && !m.isError)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      // Attach the current session's Bearer token
-      const { data: { session } } = await supabase.auth.getSession();
-      const token = session?.access_token ?? "";
+      let endpoint: string;
+      let headers: Record<string, string> = {};
+      let payload: object;
 
-      const response = await axios.post(
-        `${FASTAPI_URL}/api/chat`,
-        {
-          document_id: documentId,
-          question: trimmed,
-          chat_history: history,
-        },
-        {
-          timeout: 60000,
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      if (shareToken) {
+        // Public share-link chat — no auth needed
+        endpoint = `${FASTAPI_URL}/api/share/${shareToken}/chat`;
+        payload = { question: trimmed, chat_history: history };
+      } else {
+        // Authenticated owner/dashboard chat
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token ?? "";
+        endpoint = `${FASTAPI_URL}/api/chat`;
+        headers["Authorization"] = `Bearer ${token}`;
+        payload = { document_id: documentId, question: trimmed, chat_history: history };
+      }
+
+      const response = await axios.post(endpoint, payload, {
+        timeout: 180000, // 3 minutes — CPU-only Ollama can be slow on first load
+        headers,
+      });
 
       const assistantMessage: Message = {
         id: `assistant-${Date.now()}`,
@@ -95,9 +102,23 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
 
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (err: unknown) {
+      // Always log the full error to DevTools for debugging
+      console.error("[ChatWindow] sendMessage error:", err);
       let errText = "Sorry, I encountered an error. Please try again.";
       if (axios.isAxiosError(err)) {
-        errText = err.response?.data?.detail || errText;
+        if (err.code === "ECONNABORTED" || err.message?.includes("timeout")) {
+          errText =
+            "The request timed out — the AI model is taking too long to respond. " +
+            "This usually means Ollama is loading a model into memory. Please wait a moment and try again.";
+        } else if (err.response?.data?.detail) {
+          errText = err.response.data.detail;
+        } else if (err.response?.status === 401) {
+          errText = "Your session has expired. Please refresh the page and sign in again.";
+        } else if (err.response?.status === 404) {
+          errText = "Document not found. It may have been deleted.";
+        } else if (!err.response) {
+          errText = "Could not reach the server. Make sure the backend is running on port 8000.";
+        }
       }
 
       setMessages((prev) => [
@@ -163,26 +184,22 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
           <MessageBubble key={message.id} message={message} />
         ))}
 
-        {/* Thinking indicator */}
+        {/* Thinking indicator — dots only, no state info */}
         {isLoading && (
-          <div className="flex items-start gap-3">
+          <div className="flex items-start gap-3 animate-in fade-in duration-300">
             <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-violet-600 to-indigo-600">
               <Bot className="h-4 w-4 text-white" />
             </div>
             <div className="rounded-2xl rounded-tl-sm bg-gray-800/80 px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Loader2 className="h-3.5 w-3.5 text-violet-400 animate-spin" />
-                <span className="text-sm text-gray-400 italic">AI is thinking...</span>
-                <span className="flex gap-0.5">
-                  {[0, 1, 2].map((i) => (
-                    <span
-                      key={i}
-                      className="h-1.5 w-1.5 rounded-full bg-violet-500 animate-bounce"
-                      style={{ animationDelay: `${i * 0.15}s` }}
-                    />
-                  ))}
-                </span>
-              </div>
+              <span className="flex gap-1">
+                {[0, 1, 2].map((i) => (
+                  <span
+                    key={i}
+                    className="h-2 w-2 rounded-full bg-violet-500 animate-bounce"
+                    style={{ animationDelay: `${i * 0.15}s`, animationDuration: "0.8s" }}
+                  />
+                ))}
+              </span>
             </div>
           </div>
         )}
@@ -216,11 +233,7 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
                 : "bg-gray-700 text-gray-600 cursor-not-allowed"
             )}
           >
-            {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Send className="h-4 w-4" />
-            )}
+            <Send className="h-4 w-4" />
           </button>
         </div>
         <p className="mt-2 text-center text-xs text-gray-700">
