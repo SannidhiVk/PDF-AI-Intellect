@@ -62,6 +62,74 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(text_pages)
 
 
+def assess_extraction_quality(text: str) -> dict:
+    """
+    Deterministically flag whether extracted PDF text looks garbled/unreliable
+    (e.g. scanned image PDFs with broken OCR, or malformed character encoding).
+
+    This is intentionally NOT delegated to the LLM — small local models are
+    unreliable at *conditionally* deciding whether to mention this, and tend
+    to leak their reasoning into the output either way. Doing it here keeps
+    it deterministic and lets the API/frontend decide how to surface it
+    (e.g. a small warning banner above the AI summary), fully independent
+    of the summary text itself.
+
+    Args:
+        text: The extracted PDF text to evaluate.
+
+    Returns:
+        {
+          "is_likely_garbled": bool,
+          "reason": str | None,   # human-readable reason if flagged
+        }
+    """
+    if not text or not text.strip():
+        return {"is_likely_garbled": True, "reason": "No text was extracted."}
+
+    stripped = text.strip()
+    length = len(stripped)
+
+    # Ratio of alphanumeric + common punctuation vs. everything else.
+    # Garbled OCR/encoding artifacts tend to produce a lot of stray symbols.
+    readable_chars = sum(
+        1 for c in stripped if c.isalnum() or c.isspace() or c in ".,;:!?'\"-()[]/%$€£"
+    )
+    readable_ratio = readable_chars / length
+
+    # Average "word" length — garbled text often has abnormally long runs
+    # of characters with no whitespace (broken encoding) or is mostly
+    # single characters (bad OCR spacing).
+    words = stripped.split()
+    avg_word_len = (sum(len(w) for w in words) / len(words)) if words else 0
+
+    if readable_ratio < 0.75:
+        return {
+            "is_likely_garbled": True,
+            "reason": (
+                "A high proportion of non-standard characters was detected, "
+                "which often indicates a scanned/image-based PDF or a "
+                "text-encoding issue rather than clean extracted text."
+            ),
+        }
+
+    if avg_word_len > 20:
+        return {
+            "is_likely_garbled": True,
+            "reason": (
+                "Extracted text contains unusually long unbroken character "
+                "runs, which often indicates a PDF encoding/extraction issue."
+            ),
+        }
+
+    if length < 50:
+        return {
+            "is_likely_garbled": True,
+            "reason": "Very little text could be extracted from this PDF.",
+        }
+
+    return {"is_likely_garbled": False, "reason": None}
+
+
 def split_text_into_chunks(text: str) -> list[str]:
     """
     Split a large block of text into overlapping chunks suitable for embedding.

@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
 import { Send, Bot, User, Loader2, AlertCircle, Trash2, MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { supabase } from "@/lib/supabaseClient";
 
 const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
@@ -68,6 +69,10 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
         .filter((m) => m.id !== "welcome" && !m.isError)
         .map((m) => ({ role: m.role, content: m.content }));
 
+      // Attach the current session's Bearer token
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token ?? "";
+
       const response = await axios.post(
         `${FASTAPI_URL}/api/chat`,
         {
@@ -75,7 +80,10 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
           question: trimmed,
           chat_history: history,
         },
-        { timeout: 60000 }
+        {
+          timeout: 60000,
+          headers: { Authorization: `Bearer ${token}` },
+        }
       );
 
       const assistantMessage: Message = {

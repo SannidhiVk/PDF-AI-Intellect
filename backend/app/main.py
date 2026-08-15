@@ -26,11 +26,12 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()  # noqa: E402 — intentionally before service imports
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status  # noqa: E402
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from typing import Literal  # noqa: E402
 
+from app.auth import get_current_user  # noqa: E402
 from app.services import ai_service, db_service, pdf_service  # noqa: E402
 
 # ── Lifespan (startup / shutdown hooks) ───────────────────────────────────────
@@ -172,10 +173,7 @@ async def root():
 )
 async def process_pdf(
     file: UploadFile = File(..., description="The PDF file to process."),
-    user_id: str = Form(
-        ...,
-        description="The authenticated user's UUID (from Supabase Auth).",
-    ),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Full pipeline for a newly uploaded PDF:
@@ -280,7 +278,7 @@ async def process_pdf(
     summary="Generate a structured PDF summary",
     tags=["AI"],
 )
-async def summarize(body: SummarizeRequest):
+async def summarize(body: SummarizeRequest, user_id: str = Depends(get_current_user)):
     """
     Generate a structured, bullet-point summary of a PDF document.
 
@@ -334,13 +332,13 @@ async def summarize(body: SummarizeRequest):
     summary="Ask a question about a stored document (RAG)",
     tags=["AI"],
 )
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
     """
     Answer a natural-language question using Retrieval-Augmented Generation:
 
     1. Embed the user's question with local Ollama embeddings (query-style prefix).
     2. Search the vector DB for the top-5 most similar chunks.
-    3. Build a grounded RAG prompt and get an answer from the local llama3.1 model.
+    3. Build a grounded RAG prompt and get an answer from the local llama3.2:3b model.
     4. Return the answer along with how many source chunks were used.
     """
     if not body.question.strip():
@@ -359,18 +357,28 @@ async def chat(body: ChatRequest):
         )
 
     # ── Retrieve relevant chunks ──────────────────────────────────────────────
-    # NOTE: match_count=10 and match_threshold=0.0 are deliberately generous.
+    # match_threshold=0.0 is deliberately generous (see note below on
+    # similarity filtering). match_count was reduced from 10 -> 5:
+    # with CHUNK_SIZE=2000 chars in pdf_service.py, 10 chunks could reach
+    # ~20,000 chars (~5,000 tokens) once combined with the RAG system prompt
+    # and chat history — enough to exceed CHAT_NUM_CTX (4096 by default) and
+    # trigger Ollama's "failed to allocate CPU buffer" error. 5 chunks
+    # (~10,000 chars / ~2,500 tokens) leaves safe headroom. Raise this again
+    # only alongside a matching increase to OLLAMA_NUM_CTX in .env, and only
+    # if you've confirmed you have the RAM for it.
+    #
     # For small documents (a handful of chunks), similarity filtering can
     # incorrectly drop chunks that are still relevant just because their
     # section mixes topics (diluting the embedding). Retrieving more chunks
     # and letting the LLM's grounded prompt do the relevance filtering is
     # safer than dropping context at the DB layer. Revisit these numbers
     # once you're testing with larger, multi-page documents.
+    RAG_MATCH_COUNT = 5
     try:
         context_chunks = db_service.search_similar_chunks(
             document_id=body.document_id,
             query_embedding=query_embedding,
-            match_count=10,
+            match_count=RAG_MATCH_COUNT,
             match_threshold=0.0,
         )
         print(f"\n{'='*60}\nRETRIEVED {len(context_chunks)} CHUNKS:")
