@@ -732,3 +732,137 @@ async def delete_comment(
             detail="Comment not found or you are not authorised to delete it.",
         )
     return {"message": "Comment deleted successfully."}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SHARE INVITE VIA EMAIL (BREVO API)
+# ════════════════════════════════════════════════════════════════════════════
+
+class ShareInviteRequest(BaseModel):
+    recipient_email: str
+    sender_name: str = "Someone"
+
+
+@app.post(
+    "/api/documents/{document_id}/share/invite",
+    status_code=status.HTTP_200_OK,
+    summary="Send a share-link invitation email to a recipient via Brevo",
+    tags=["Sharing"],
+)
+async def send_share_invite(
+    document_id: str,
+    body: ShareInviteRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """
+    Sends a formatted email to `recipient_email` containing the document's
+    active share link using Brevo's transactional API. Requires BREVO_API_KEY in .env.
+    """
+    import httpx
+
+    brevo_api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    sender_email = os.environ.get("BREVO_SENDER_EMAIL", "no-reply@pdfintellect.com").strip()
+    sender_name = os.environ.get("BREVO_SENDER_NAME", "PDF Intellect").strip()
+
+    if not brevo_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Email sending is not configured. "
+                "Add BREVO_API_KEY to your backend/.env file."
+            ),
+        )
+
+    # Get or create the share link
+    try:
+        share = db_service.create_share(document_id=document_id, user_id=user_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    share_url = _build_share_url(share["share_token"])
+
+    # Fetch doc name for the email
+    doc = db_service.get_document_by_id(document_id, user_id=user_id)
+    file_name = doc.get("file_name", "a document") if doc else "a document"
+
+    html_body = f"""
+    <div style="font-family:Inter,sans-serif;background:#0a0a0f;padding:40px 0;min-height:100vh">
+      <div style="max-width:520px;margin:0 auto;background:#111117;border:1px solid #2a2a3a;border-radius:20px;overflow:hidden">
+        <!-- Header -->
+        <div style="background:linear-gradient(135deg,#6d28d9,#4f46e5);padding:36px 40px;text-align:center">
+          <div style="font-size:24px;font-weight:700;color:#fff;letter-spacing:-0.5px">📄 PDF Intellect</div>
+          <div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:4px">AI Document Assistant</div>
+        </div>
+        <!-- Body -->
+        <div style="padding:36px 40px">
+          <p style="color:#e5e7eb;font-size:15px;line-height:1.6;margin:0 0 20px">
+            Hi there,<br><br>
+            <strong style="color:#fff">{body.sender_name}</strong> has shared a document with you on
+            <strong style="color:#fff">PDF Intellect</strong>:
+          </p>
+          <!-- Doc card -->
+          <div style="background:#1a1a2e;border:1px solid #2a2a3a;border-radius:14px;padding:20px 24px;margin-bottom:28px">
+            <div style="display:flex;align-items:center;gap:12px">
+              <div style="background:linear-gradient(135deg,#6d28d9,#4f46e5);border-radius:10px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">📄</div>
+              <div>
+                <div style="color:#f3f4f6;font-weight:600;font-size:14px">{file_name}</div>
+                <div style="color:#6b7280;font-size:12px;margin-top:2px">Shared with you · No account needed</div>
+              </div>
+            </div>
+          </div>
+          <!-- CTA -->
+          <div style="text-align:center;margin-bottom:28px">
+            <a href="{share_url}"
+               style="display:inline-block;background:linear-gradient(135deg,#6d28d9,#4f46e5);color:#fff;text-decoration:none;font-weight:600;font-size:14px;border-radius:12px;padding:14px 32px;box-shadow:0 4px 20px rgba(109,40,217,0.4)">
+              View Document →
+            </a>
+          </div>
+          <p style="color:#6b7280;font-size:12px;text-align:center;margin:0">
+            You can view the summary, ask the AI questions, and leave comments.<br>
+            No account or sign-up required.
+          </p>
+        </div>
+        <!-- Footer -->
+        <div style="border-top:1px solid #2a2a3a;padding:20px 40px;text-align:center">
+          <p style="color:#4b5563;font-size:11px;margin:0">
+            This invitation was sent via PDF Intellect. If you weren't expecting this, you can safely ignore it.
+          </p>
+        </div>
+      </div>
+    </div>
+    """
+
+    payload = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": body.recipient_email}],
+        "subject": f"{body.sender_name} shared \"{file_name}\" with you",
+        "htmlContent": html_body,
+    }
+
+    headers = {
+        "accept": "application/json",
+        "api-key": brevo_api_key,
+        "content-type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(
+                "https://api.brevo.com/v3/smtp/email",
+                json=payload,
+                headers=headers,
+            )
+            if res.status_code not in (200, 201, 202):
+                res_data = res.json() if res.headers.get("content-type") == "application/json" else {}
+                err_msg = res_data.get("message") or res.text
+                raise Exception(f"Brevo API Error ({res.status_code}): {err_msg}")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to send email via Brevo: {exc}",
+        )
+
+    return {
+        "message": f"Invitation sent to {body.recipient_email}.",
+        "share_url": share_url,
+    }

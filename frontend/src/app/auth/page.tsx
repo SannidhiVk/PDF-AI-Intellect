@@ -13,7 +13,7 @@ import { useRouter } from "next/navigation";
 import { Brain, Mail, Lock, User, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 
-type AuthMode = "signin" | "signup";
+type AuthMode = "signin" | "signup" | "reset";
 
 export default function AuthPage() {
   const router = useRouter();
@@ -24,6 +24,7 @@ export default function AuthPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [emailSent, setEmailSent] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -41,6 +42,12 @@ export default function AuthPage() {
         });
         if (error) throw error;
         setEmailSent(true);
+      } else if (mode === "reset") {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: `${window.location.origin}/auth/update-password`,
+        });
+        if (error) throw error;
+        setResetSent(true);
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
@@ -69,6 +76,30 @@ export default function AuthPage() {
           </p>
           <button
             onClick={() => { setEmailSent(false); setMode("signin"); }}
+            className="mt-6 text-sm text-gray-500 hover:text-gray-300 underline underline-offset-2 transition-colors"
+          >
+            Back to Sign In
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (resetSent) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-950 px-4">
+        <div className="relative max-w-md w-full rounded-2xl border border-gray-800 bg-gray-900/80 p-10 text-center backdrop-blur-xl shadow-2xl">
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-sky-900/40">
+            <CheckCircle2 className="h-8 w-8 text-sky-400" />
+          </div>
+          <h2 className="text-xl font-semibold text-white">Reset link sent!</h2>
+          <p className="mt-3 text-sm leading-relaxed text-gray-400">
+            We emailed a password reset link to{" "}
+            <span className="font-medium text-violet-400">{email}</span>.{" "}
+            Follow the link to choose a new password.
+          </p>
+          <button
+            onClick={() => { setResetSent(false); setMode("signin"); setEmail(""); }}
             className="mt-6 text-sm text-gray-500 hover:text-gray-300 underline underline-offset-2 transition-colors"
           >
             Back to Sign In
@@ -121,6 +152,12 @@ export default function AuthPage() {
               onClick={() => { setMode("signup"); setError(null); }}
               id="auth-tab-signup"
             />
+            <TabBtn
+              label="Reset"
+              active={mode === "reset"}
+              onClick={() => { setMode("reset"); setError(null); }}
+              id="auth-tab-reset"
+            />
           </div>
 
           {/* Form */}
@@ -167,29 +204,38 @@ export default function AuthPage() {
               </div>
             </div>
 
-            {/* Password */}
-            <div>
-              <label htmlFor="auth-password" className="block mb-1.5 text-xs font-medium text-gray-400">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-600" />
-                <input
-                  id="auth-password"
-                  type="password"
-                  required
-                  autoComplete={mode === "signup" ? "new-password" : "current-password"}
-                  minLength={6}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full rounded-lg border border-gray-700 bg-gray-800/60 pl-10 pr-4 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600/50 transition-colors"
-                />
+            {/* Password — hidden on reset mode */}
+            {mode !== "reset" && (
+              <div>
+                <label htmlFor="auth-password" className="block mb-1.5 text-xs font-medium text-gray-400">
+                  Password
+                </label>
+                <div className="relative">
+                  <Lock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-600" />
+                  <input
+                    id="auth-password"
+                    type="password"
+                    required={mode !== "reset"}
+                    autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                    minLength={6}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full rounded-lg border border-gray-700 bg-gray-800/60 pl-10 pr-4 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600/50 transition-colors"
+                  />
+                </div>
+                {mode === "signup" && (
+                  <p className="mt-1.5 text-xs text-gray-600">Minimum 6 characters</p>
+                )}
               </div>
-              {mode === "signup" && (
-                <p className="mt-1.5 text-xs text-gray-600">Minimum 6 characters</p>
-              )}
-            </div>
+            )}
+
+            {/* Reset mode helper text */}
+            {mode === "reset" && (
+              <p className="text-xs text-gray-500 leading-relaxed -mt-1">
+                Enter your account email and we&apos;ll send you a link to reset your password.
+              </p>
+            )}
 
             {/* Error message */}
             {error && (
@@ -209,10 +255,12 @@ export default function AuthPage() {
               {loading ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  {mode === "signup" ? "Creating account…" : "Signing in…"}
+                  {mode === "signup" ? "Creating account…" : mode === "reset" ? "Sending reset link…" : "Signing in…"}
                 </>
               ) : mode === "signup" ? (
                 "Create Account"
+              ) : mode === "reset" ? (
+                "Send Reset Link"
               ) : (
                 "Sign In"
               )}
@@ -229,6 +277,23 @@ export default function AuthPage() {
                   className="text-violet-400 hover:text-violet-300 font-medium transition-colors"
                 >
                   Sign up
+                </button>
+                <span className="mx-1.5">·</span>
+                <button
+                  onClick={() => { setMode("reset"); setError(null); }}
+                  className="text-gray-500 hover:text-gray-300 transition-colors"
+                >
+                  Forgot password?
+                </button>
+              </>
+            ) : mode === "reset" ? (
+              <>
+                Remember your password?{" "}
+                <button
+                  onClick={() => { setMode("signin"); setError(null); }}
+                  className="text-violet-400 hover:text-violet-300 font-medium transition-colors"
+                >
+                  Sign in
                 </button>
               </>
             ) : (

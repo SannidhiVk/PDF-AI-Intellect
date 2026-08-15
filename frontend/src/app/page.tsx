@@ -8,6 +8,7 @@ import PdfUploader from "@/components/PdfUploader";
 import SummaryView from "@/components/SummaryView";
 import ChatWindow from "@/components/ChatWindow";
 import CommentSection from "@/components/CommentSection";
+import ShareControls from "@/components/ShareControls";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/AuthContext";
 import { supabase } from "@/lib/supabaseClient";
@@ -183,12 +184,12 @@ export default function DashboardPage() {
       {/* Main Content */}
       <main className="flex flex-1 flex-col min-w-0 overflow-hidden">
         {/* Top bar */}
-        <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800/60 flex-shrink-0">
-          <div>
+        <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800/60 flex-shrink-0 gap-4">
+          <div className="min-w-0">
             <h1 className="text-lg font-semibold text-white">
               {activeView === "upload" ? "Document Analysis" : "Document Chat"}
             </h1>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs text-gray-500 truncate">
               {activeView === "upload"
                 ? "Upload a PDF to extract insights and AI summaries"
                 : selectedDocument
@@ -197,8 +198,19 @@ export default function DashboardPage() {
             </p>
           </div>
 
+          {/* Share controls — visible whenever a document is selected */}
+          {selectedDocId && authToken && (
+            <div className="flex-shrink-0">
+              <ShareControls
+                key={selectedDocId}
+                documentId={selectedDocId}
+                authToken={authToken}
+              />
+            </div>
+          )}
+
           {/* View toggle tabs */}
-          <div className="flex items-center gap-1 rounded-xl bg-gray-900 border border-gray-800 p-1">
+          <div className="flex items-center gap-1 rounded-xl bg-gray-900 border border-gray-800 p-1 flex-shrink-0">
             <TabButton
               icon={<UploadCloud className="h-3.5 w-3.5" />}
               label="Analyze"
@@ -324,8 +336,6 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
           <SummaryView
             summary={selectedDocument.summary}
             filename={selectedDocument.filename}
-            documentId={selectedDocument.id}
-            authToken={authToken ?? undefined}
           />
 
           {/* Comments — owner view */}

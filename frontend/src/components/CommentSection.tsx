@@ -17,6 +17,8 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import axios from "axios";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   MessageCircle,
   Send,
@@ -436,9 +438,9 @@ function CommentBubble({
             {relativeTime(comment.created_at)}
           </span>
         </div>
-        <p className="mt-0.5 text-sm text-gray-300 leading-relaxed break-words">
-          {comment.content}
-        </p>
+        <div className="mt-0.5 prose prose-invert prose-sm max-w-none prose-p:text-gray-300 prose-p:leading-relaxed prose-p:my-0 prose-strong:text-gray-200 prose-code:text-sky-300 prose-code:bg-gray-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-a:text-violet-400 hover:prose-a:text-violet-300 break-words">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{comment.content}</ReactMarkdown>
+        </div>
 
         {/* Actions */}
         <div className="mt-1.5 flex items-center gap-3">

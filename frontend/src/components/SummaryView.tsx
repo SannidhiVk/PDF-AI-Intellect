@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -9,39 +9,16 @@ import {
   ChevronUp,
   BookOpen,
   Sparkles,
-  Link2,
-  Link2Off,
-  Check,
-  Loader2,
 } from "lucide-react";
-import axios from "axios";
 import { cn } from "@/lib/utils";
-
-const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
 interface SummaryViewProps {
   summary: string;
   filename: string;
-  /** Required to enable the Share / Revoke button */
-  documentId?: string;
-  /** Owner's JWT; required for share/revoke actions */
-  authToken?: string;
 }
 
-export default function SummaryView({
-  summary,
-  filename,
-  documentId,
-  authToken,
-}: SummaryViewProps) {
+export default function SummaryView({ summary, filename }: SummaryViewProps) {
   const [isExpanded, setIsExpanded] = useState(true);
-
-  // ── Share state ──────────────────────────────────────────────────────────
-  const [shareUrl, setShareUrl] = useState<string | null>(null);
-  const [shareActive, setShareActive] = useState(false);
-  const [sharing, setSharing] = useState(false);
-  const [revoking, setRevoking] = useState(false);
-  const [copied, setCopied] = useState(false);
 
   // Word count
   const wordCount = summary.split(/\s+/).filter(Boolean).length;
@@ -54,51 +31,6 @@ export default function SummaryView({
     .replace(/`([^`]+)`/g, "$1")
     .replace(/\n+/g, " ")
     .trim();
-
-  const handleShare = useCallback(async () => {
-    if (!documentId || !authToken) return;
-    setSharing(true);
-    try {
-      const res = await axios.post<{ share_url: string; is_active: boolean }>(
-        `${FASTAPI_URL}/api/documents/${documentId}/share`,
-        {},
-        { headers: { Authorization: `Bearer ${authToken}` } }
-      );
-      const url = res.data.share_url;
-      setShareUrl(url);
-      setShareActive(true);
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
-    } catch {
-      // silently ignore — user can retry
-    } finally {
-      setSharing(false);
-    }
-  }, [documentId, authToken]);
-
-  const handleCopy = useCallback(async () => {
-    if (!shareUrl) return;
-    await navigator.clipboard.writeText(shareUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
-  }, [shareUrl]);
-
-  const handleRevoke = useCallback(async () => {
-    if (!documentId || !authToken) return;
-    setRevoking(true);
-    try {
-      await axios.delete(`${FASTAPI_URL}/api/documents/${documentId}/share`, {
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-      setShareUrl(null);
-      setShareActive(false);
-    } catch {
-      // silently ignore
-    } finally {
-      setRevoking(false);
-    }
-  }, [documentId, authToken]);
 
   return (
     <div className="rounded-2xl border border-gray-800/60 bg-gray-900/60 backdrop-blur-sm overflow-hidden">
@@ -114,68 +46,12 @@ export default function SummaryView({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap justify-end">
+        <div className="flex items-center gap-2">
           {/* Metadata badges */}
           <div className="hidden sm:flex items-center gap-2">
             <Badge icon={<BookOpen className="h-3 w-3" />} label={`${wordCount} words`} />
             <Badge icon={<FileText className="h-3 w-3" />} label={`~${readingTime} min read`} />
           </div>
-
-          {/* Share / Revoke (only when documentId + authToken provided) */}
-          {documentId && authToken && (
-            <div className="flex items-center gap-1.5">
-              {!shareActive ? (
-                <button
-                  onClick={handleShare}
-                  disabled={sharing}
-                  id="share-doc-btn"
-                  className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium bg-violet-700/30 border border-violet-700/40 text-violet-300 hover:bg-violet-700/50 hover:border-violet-600/60 transition-all duration-150 disabled:opacity-50"
-                >
-                  {sharing ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Link2 className="h-3.5 w-3.5" />
-                  )}
-                  Share
-                </button>
-              ) : (
-                <>
-                  {/* Copy URL button */}
-                  <button
-                    onClick={handleCopy}
-                    id="copy-share-link-btn"
-                    className={cn(
-                      "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-all duration-200",
-                      copied
-                        ? "bg-green-700/30 border border-green-700/40 text-green-300"
-                        : "bg-violet-700/30 border border-violet-700/40 text-violet-300 hover:bg-violet-700/50"
-                    )}
-                  >
-                    {copied ? (
-                      <><Check className="h-3.5 w-3.5" /> Copied!</>
-                    ) : (
-                      <><Link2 className="h-3.5 w-3.5" /> Copy Link</>
-                    )}
-                  </button>
-
-                  {/* Revoke button */}
-                  <button
-                    onClick={handleRevoke}
-                    disabled={revoking}
-                    id="revoke-share-btn"
-                    className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium bg-red-900/20 border border-red-800/30 text-red-400 hover:bg-red-900/40 hover:text-red-300 transition-all duration-150 disabled:opacity-50"
-                  >
-                    {revoking ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Link2Off className="h-3.5 w-3.5" />
-                    )}
-                    Revoke
-                  </button>
-                </>
-              )}
-            </div>
-          )}
 
           {/* Expand / Collapse */}
           <button
@@ -191,14 +67,6 @@ export default function SummaryView({
           </button>
         </div>
       </div>
-
-      {/* Active share URL bar */}
-      {shareActive && shareUrl && (
-        <div className="flex items-center gap-2 px-6 py-2.5 bg-violet-950/30 border-b border-violet-800/20">
-          <Link2 className="h-3.5 w-3.5 text-violet-400 shrink-0" />
-          <p className="flex-1 text-xs text-violet-300 truncate font-mono">{shareUrl}</p>
-        </div>
-      )}
 
       {/* Content */}
       <div
@@ -252,4 +120,3 @@ function Badge({ icon, label }: { icon: React.ReactNode; label: string }) {
     </span>
   );
 }
-
