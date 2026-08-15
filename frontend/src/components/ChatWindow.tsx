@@ -17,11 +17,13 @@ export interface Message {
 }
 
 interface ChatWindowProps {
-  documentId: string;
+  documentId?: string;
   filename: string;
+  /** When provided, chats via the public /api/share/{token}/chat endpoint (no auth). */
+  shareToken?: string;
 }
 
-export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
+export default function ChatWindow({ documentId, filename, shareToken }: ChatWindowProps) {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -69,22 +71,27 @@ export default function ChatWindow({ documentId, filename }: ChatWindowProps) {
         .filter((m) => m.id !== "welcome" && !m.isError)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      // Attach the current session's Bearer token
-      const { data: { session } } = await supabase.auth.getSession();
-      const token = session?.access_token ?? "";
+      let endpoint: string;
+      let headers: Record<string, string> = {};
+      let payload: object;
 
-      const response = await axios.post(
-        `${FASTAPI_URL}/api/chat`,
-        {
-          document_id: documentId,
-          question: trimmed,
-          chat_history: history,
-        },
-        {
-          timeout: 60000,
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      if (shareToken) {
+        // Public share-link chat — no auth needed
+        endpoint = `${FASTAPI_URL}/api/share/${shareToken}/chat`;
+        payload = { question: trimmed, chat_history: history };
+      } else {
+        // Authenticated owner/dashboard chat
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token ?? "";
+        endpoint = `${FASTAPI_URL}/api/chat`;
+        headers["Authorization"] = `Bearer ${token}`;
+        payload = { document_id: documentId, question: trimmed, chat_history: history };
+      }
+
+      const response = await axios.post(endpoint, payload, {
+        timeout: 60000,
+        headers,
+      });
 
       const assistantMessage: Message = {
         id: `assistant-${Date.now()}`,

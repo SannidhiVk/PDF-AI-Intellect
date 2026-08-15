@@ -7,8 +7,12 @@ import Sidebar from "@/components/Sidebar";
 import PdfUploader from "@/components/PdfUploader";
 import SummaryView from "@/components/SummaryView";
 import ChatWindow from "@/components/ChatWindow";
+import CommentSection from "@/components/CommentSection";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/AuthContext";
+import { supabase } from "@/lib/supabaseClient";
+
+const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
 interface UploadedDocument {
   id: string;
@@ -26,6 +30,54 @@ export default function DashboardPage() {
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [isFetchingDocs, setIsFetchingDocs] = useState(false);
+
+  /**
+   * Fetch the user's document history from the backend.
+   * Called on mount (to restore sidebar after refresh) and after each upload.
+   * Uses the JWT so the backend can scope results to this user only.
+   */
+  const fetchDocuments = useCallback(async (token: string) => {
+    setIsFetchingDocs(true);
+    try {
+      const res = await fetch(`${FASTAPI_URL}/api/documents`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data: Array<{ id: string; file_name: string; created_at: string }> = await res.json();
+      setDocuments(
+        data.map((d) => ({
+          id: d.id,
+          filename: d.file_name,
+          // ISO timestamp → readable time (e.g. "14:32")
+          uploadedAt: new Date(d.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          summary: "", // summary not stored server-side yet; empty on restore
+        }))
+      );
+    } catch {
+      // Non-fatal: sidebar will just be empty until next upload
+    } finally {
+      setIsFetchingDocs(false);
+    }
+  }, []);
+
+  // Keep the access token fresh for Share/Comment calls
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      const token = session?.access_token ?? null;
+      setAuthToken(token);
+      // Restore sidebar history from the API now that we have a token
+      if (token) fetchDocuments(token);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => setAuthToken(session?.access_token ?? null)
+    );
+    return () => subscription.unsubscribe();
+  }, [fetchDocuments]);
 
   // Redirect to /auth if not authenticated
   useEffect(() => {
@@ -48,11 +100,18 @@ export default function DashboardPage() {
         uploadedAt: formatted,
       };
 
-      setDocuments((prev) => [newDoc, ...prev]);
+      // Prepend the new upload and deduplicate (id is the key)
+      setDocuments((prev) => {
+        const without = prev.filter((d) => d.id !== newDoc.id);
+        return [newDoc, ...without];
+      });
       setSelectedDocId(newDoc.id);
       setShowSummary(true);
+
+      // Refresh the full list so the sidebar stays consistent with the DB
+      if (authToken) fetchDocuments(authToken);
     },
-    []
+    [authToken, fetchDocuments]
   );
 
   // Show full-screen spinner while session is being resolved.
@@ -89,6 +148,7 @@ export default function DashboardPage() {
         onSelectHistory={handleSelectHistory}
         selectedDocumentId={selectedDocId}
         userEmail={user.email ?? ""}
+        isLoadingHistory={isFetchingDocs}
       />
 
       {/* Main Content */}
@@ -137,6 +197,8 @@ export default function DashboardPage() {
               showSummary={showSummary}
               onGoToChat={() => setActiveView("chat")}
               userId={user.id}
+              authToken={authToken}
+              ownerName={user.email ?? "You"}
             />
           )}
 
@@ -177,9 +239,11 @@ interface UploadViewProps {
   showSummary: boolean;
   onGoToChat: () => void;
   userId: string;
+  authToken: string | null;
+  ownerName: string;
 }
 
-function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId }: UploadViewProps) {
+function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId, authToken, ownerName }: UploadViewProps) {
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       {/* Welcome banner — only shown when no document uploaded */}
@@ -220,6 +284,17 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
           <SummaryView
             summary={selectedDocument.summary}
             filename={selectedDocument.filename}
+            documentId={selectedDocument.id}
+            authToken={authToken ?? undefined}
+          />
+
+          {/* Comments — owner view */}
+          <CommentSection
+            mode="owner"
+            documentId={selectedDocument.id}
+            authToken={authToken ?? undefined}
+            currentUserName={ownerName}
+            defaultCollapsed
           />
 
           {/* CTA to chat */}

@@ -1,6 +1,6 @@
 "use client";
 
-import { FileText, MessageSquare, History, LogOut, Brain, ChevronRight, User } from "lucide-react";
+import { FileText, MessageSquare, History, LogOut, Brain, ChevronRight, User, Loader2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
@@ -12,6 +12,8 @@ interface SidebarProps {
   onSelectHistory: (id: string) => void;
   selectedDocumentId: string | null;
   userEmail: string;
+  /** When true, show a loading spinner in the history section. */
+  isLoadingHistory?: boolean;
 }
 
 export default function Sidebar({
@@ -21,6 +23,7 @@ export default function Sidebar({
   onSelectHistory,
   selectedDocumentId,
   userEmail,
+  isLoadingHistory = false,
 }: SidebarProps) {
   const router = useRouter();
 
@@ -72,7 +75,12 @@ export default function Sidebar({
           </p>
         </div>
 
-        {uploadHistory.length === 0 ? (
+        {isLoadingHistory ? (
+          <div className="px-2 py-4 flex items-center gap-2 text-gray-600">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <p className="text-xs">Loading documents…</p>
+          </div>
+        ) : uploadHistory.length === 0 ? (
           <div className="px-2 py-4 text-center">
             <p className="text-xs text-gray-600">No documents yet</p>
           </div>

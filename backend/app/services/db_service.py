@@ -96,7 +96,12 @@ def save_document_metadata(
         "file_url": file_url,
     }
 
-    response = _get_client().table("documents").insert(payload).execute()
+    # Use the service-role client so the insert succeeds regardless of the
+    # documents RLS INSERT policy (which checks auth.uid(), a value that is
+    # always NULL when the request originates from this server-side Python
+    # client rather than from a browser session).  Ownership is enforced
+    # here by including user_id in the payload, not by relying on RLS alone.
+    response = _get_service_client().table("documents").insert(payload).execute()
 
     if not response.data:
         raise RuntimeError(
@@ -140,8 +145,11 @@ def store_document_chunks(
         for chunk, embedding in zip(chunks, embeddings)
     ]
 
-    # Supabase accepts bulk inserts in a single call
-    response = _get_client().table("document_chunks").insert(rows).execute()
+    # Use the service-role client for the same reason as save_document_metadata:
+    # the RLS INSERT policy on document_chunks checks auth.uid(), which is
+    # always NULL for server-side Python requests → inserts would silently
+    # fail or raise 403 without the service key.
+    response = _get_service_client().table("document_chunks").insert(rows).execute()
 
     if not response.data:
         raise RuntimeError(
@@ -207,21 +215,338 @@ def search_similar_chunks(
 
 # ── Document Fetch ────────────────────────────────────────────────────────────
 
-def get_document_by_id(document_id: str) -> dict[str, Any] | None:
+def get_document_by_id(document_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     """
     Fetch a single document's metadata row by its UUID.
 
+    When user_id is provided the query also filters by that column, acting as
+    an ownership check: a document that exists but belongs to a different user
+    will return None (same as not found), preventing information leakage.
+
     Args:
         document_id: UUID of the document.
+        user_id:     Optional – the requesting user's UUID.  When supplied, the
+                     query adds a WHERE user_id = ? filter.
 
     Returns:
-        The document row as a dict, or None if not found.
+        The document row as a dict, or None if not found / not owned.
     """
-    response = (
-        _get_client().table("documents")
+    query = (
+        _get_service_client().table("documents")
         .select("*")
         .eq("id", document_id)
-        .single()
+    )
+    if user_id:
+        query = query.eq("user_id", user_id)
+
+    response = query.maybe_single().execute()
+    return response.data
+
+
+def get_documents_by_user(user_id: str) -> list[dict[str, Any]]:
+    """
+    Fetch all document metadata rows that belong to the given user.
+
+    Results are ordered newest-first so the sidebar can render them as a
+    chronological history without any client-side sorting.
+
+    Args:
+        user_id: The authenticated user's UUID.
+
+    Returns:
+        A list of document row dicts (may be empty if the user has no docs).
+    """
+    response = (
+        _get_service_client().table("documents")
+        .select("id, file_name, file_url, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
         .execute()
     )
-    return response.data
+    return response.data or []
+
+
+# ── Service-Role Client (bypasses RLS) ───────────────────────────────────────
+# Used ONLY for server-side operations that legitimately need to act outside
+# of Row Level Security, e.g. inserting guest comments where user_id IS NULL
+# (no authenticated user context).  Never expose this key to the frontend.
+
+_service_client: Client | None = None
+
+
+def _get_service_client() -> Client:
+    """
+    Return a Supabase client initialised with the service-role key.
+    Falls back to the anon client if SUPABASE_SERVICE_KEY is not set or invalid,
+    ensuring local development and public RLS policies continue to work smoothly.
+    """
+    global _service_client
+    if _service_client is not None:
+        return _service_client
+
+    url = os.environ.get("SUPABASE_URL", "").strip()
+    service_key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+
+    # If key is empty or a placeholder string, fall back immediately
+    if not service_key or service_key.startswith("your-") or not service_key.startswith("ey"):
+        return _get_client()
+
+    try:
+        _service_client = create_client(url, service_key)
+        return _service_client
+    except Exception as exc:
+        import warnings
+        warnings.warn(
+            f"Failed to initialise service-role client ({exc}). Falling back to anon client.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _get_client()
+
+
+# ── Share Management ──────────────────────────────────────────────────────────
+
+def create_share(document_id: str, user_id: str) -> dict[str, Any]:
+    """
+    Create (or re-activate) a share link for a document.
+
+    If an inactive share already exists for this document it is re-activated
+    rather than creating a new row, keeping token URLs stable.
+
+    Returns:
+        The document_shares row as a dict.
+
+    Note: uses the service-role client, same as get_share_by_token/comments
+    below. The anon client never forwards the user's JWT to PostgREST, so
+    auth.uid() is NULL for every call made through it — the RLS policy
+    "auth.uid() = created_by" would then reject every insert/update
+    unconditionally. Ownership is instead enforced here in Python via the
+    .eq("created_by", user_id) filter, the same pattern already used by
+    owner_delete_comment.
+    """
+    client = _get_service_client()
+
+    # Check for existing row (active or inactive)
+    existing = (
+        client.table("document_shares")
+        .select("*")
+        .eq("document_id", document_id)
+        .eq("created_by", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        row = existing.data[0]
+        if not row["is_active"]:
+            # Re-activate the existing share
+            updated = (
+                client.table("document_shares")
+                .update({"is_active": True})
+                .eq("id", row["id"])
+                .execute()
+            )
+            return updated.data[0]
+        return row
+
+    # Create a fresh share link
+    response = (
+        client.table("document_shares")
+        .insert({"document_id": document_id, "created_by": user_id})
+        .execute()
+    )
+    if not response.data:
+        raise RuntimeError(f"Failed to create share link. Response: {response}")
+    return response.data[0]
+
+
+def revoke_share(document_id: str, user_id: str) -> bool:
+    """
+    Deactivate the share link for a document (sets is_active = FALSE).
+
+    Returns True if a row was updated, False if no active share existed.
+
+    Note: uses the service-role client for the same reason as create_share
+    above — the anon client can't satisfy auth.uid() = created_by via RLS.
+    Ownership is enforced here via .eq("created_by", user_id) instead.
+    """
+    response = (
+        _get_service_client().table("document_shares")
+        .update({"is_active": False})
+        .eq("document_id", document_id)
+        .eq("created_by", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return bool(response.data)
+
+
+def get_share_by_token(token: str) -> dict[str, Any] | None:
+    """
+    Fetch an *active* share row by its token UUID.
+    Uses the service-role client so it bypasses RLS.
+
+    Returns None if the token is not found, malformed, or the share is
+    inactive. Malformed tokens (e.g. the frontend accidentally sending
+    the literal string "undefined") are rejected here BEFORE hitting
+    Postgres — otherwise PostgREST raises a raw 22P02 error ("invalid
+    input syntax for type uuid") which bubbles up as an unhandled 500
+    instead of a clean "not found".
+    """
+    import uuid as _uuid
+
+    try:
+        _uuid.UUID(str(token))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+    response = (
+        _get_service_client().table("document_shares")
+        .select("*, documents(id, file_name)")
+        .eq("share_token", token)
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
+        return None
+    return response.data[0]
+
+
+# ── Comment Management ────────────────────────────────────────────────────────
+
+def get_comments(document_id: str) -> list[dict[str, Any]]:
+    """
+    Fetch all comments for a document, ordered oldest-first.
+    Returns a flat list; the caller is responsible for threading.
+    Uses the service-role client so it works for both owner and public share.
+    """
+    response = (
+        _get_service_client().table("document_comments")
+        .select("*")
+        .eq("document_id", document_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def create_comment(
+    document_id: str,
+    content: str,
+    author_name: str,
+    user_id: str | None = None,
+    parent_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Insert a new comment (or reply) into document_comments.
+
+    Always uses the service-role client so the insert succeeds regardless of
+    the document_comments RLS INSERT policy (which checks auth.uid(), a value
+    that is always NULL when the request originates from this server-side
+    Python client rather than from a browser session).
+
+    Ownership and access control are enforced here in Python:
+      - Authenticated owner: user_id is set in the payload.
+      - Guests via share link: user_id is omitted (NULL in DB).
+      - parent_id is validated as a UUID before being sent to Postgres to
+        avoid raw 22P02 "invalid input syntax for type uuid" errors.
+
+    This mirrors the same pattern used by create_share / revoke_share.
+
+    Args:
+        document_id:  UUID of the parent document.
+        content:      Comment text.
+        author_name:  Display name (required for guests; set from profile for auth users).
+        user_id:      Supabase auth UID, or None for guests.
+        parent_id:    UUID of the parent comment for replies, or None.
+
+    Returns:
+        The inserted row as a dict.
+    """
+    import uuid as _uuid
+
+    payload: dict[str, Any] = {
+        "document_id": document_id,
+        "content": content,
+        "author_name": author_name,
+    }
+    if user_id:
+        payload["user_id"] = user_id
+
+    # Validate parent_id as a real UUID before sending to Postgres.
+    # Passing the Python string "None" or a malformed value would cause a
+    # raw 22P02 Postgres error that surfaces as an opaque 500.
+    if parent_id is not None:
+        try:
+            _uuid.UUID(str(parent_id))
+            payload["parent_id"] = parent_id
+        except (ValueError, AttributeError):
+            # Treat invalid/garbage parent_id as "no parent"
+            pass
+
+    # Always use the service-role client for server-side comment inserts.
+    # The anon client does NOT forward the user's JWT to PostgREST, so
+    # auth.uid() is NULL inside Postgres — the RLS INSERT policy
+    # (auth.uid() = user_id) then rejects the write unconditionally,
+    # even when user_id is a valid authenticated UUID.
+    # This is the exact same root cause that was fixed for create_share /
+    # revoke_share. Using the service-role client bypasses RLS; ownership is
+    # enforced above by Python logic (user_id payload field).
+    client = _get_service_client()
+
+    response = client.table("document_comments").insert(payload).execute()
+    if not response.data:
+        raise RuntimeError(f"Failed to insert comment. Response: {response}")
+    return response.data[0]
+
+
+def delete_comment(comment_id: str, user_id: str) -> bool:
+    """
+    Delete a comment owned by user_id (cascades to replies via FK).
+
+    Returns True if deleted, False if not found / not authorised.
+    """
+    response = (
+        _get_client().table("document_comments")
+        .delete()
+        .eq("id", comment_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return bool(response.data)
+
+
+def owner_delete_comment(comment_id: str, owner_user_id: str) -> bool:
+    """
+    Allow the document owner to delete any comment on their document.
+    Verifies ownership via a JOIN to the documents table.
+    Uses the service-role client because the owner RLS DELETE policy
+    requires auth.uid() = documents.user_id — valid for REST requests
+    but not directly enforceable in this server-side context.
+
+    Returns True if deleted, False if the comment wasn't found or the
+    caller doesn't own the parent document.
+    """
+    # First verify the caller owns the parent document
+    verify = (
+        _get_service_client().table("document_comments")
+        .select("id, documents!document_comments_document_id_fkey(user_id)")
+        .eq("id", comment_id)
+        .limit(1)
+        .execute()
+    )
+    if not verify.data:
+        return False
+
+    doc_owner = verify.data[0].get("documents", {}).get("user_id")
+    if doc_owner != owner_user_id:
+        return False
+
+    response = (
+        _get_service_client().table("document_comments")
+        .delete()
+        .eq("id", comment_id)
+        .execute()
+    )
+    return bool(response.data)
