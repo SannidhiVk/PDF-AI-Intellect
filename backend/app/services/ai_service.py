@@ -1,58 +1,70 @@
 """
 ai_service.py
 -------------
-Wraps all LLM interactions — all via Groq Cloud API:
-  - Groq embeddings (`nomic-embed-text-v1_5`) for 768-dimensional vector embeddings.
+Wraps all LLM interactions:
+  - OpenAI embeddings (`text-embedding-3-small`, truncated to 768 dims) for vector search.
   - Groq Cloud API (`llama-3.3-70b-versatile`) for fast AI Summaries and RAG Chat.
 
-Note: This service no longer depends on a local Ollama instance. Embeddings are
-generated via Groq's cloud embeddings endpoint, which is required for deployment
-on Render (or any environment without a local Ollama daemon).
+Note: Embeddings were previously routed through Groq's cloud API using
+`nomic-embed-text-v1_5`. Groq does not expose any embeddings endpoint on
+standard accounts (confirmed via GET /openai/v1/models — no embedding model
+is listed), so that path was a 404 in production. Embeddings now go through
+OpenAI instead, with `dimensions=768` requested explicitly so the output
+vector still matches the existing Supabase pgvector column (`vector(768)`)
+with zero schema migration required.
 """
 
 import os
 import textwrap
 
 from groq import Groq
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 load_dotenv("backend/.env")
 
-# ── Groq Connection (For Embeddings, Summaries & RAG Chat) ─────────────────
+# ── Groq Connection (Summaries & RAG Chat only) ─────────────────────────────
 _GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 _groq_client = Groq(api_key=_GROQ_API_KEY) if _GROQ_API_KEY else None
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
-# ── Embedding Model (Groq Cloud — replaces local Ollama) ───────────────────
-EMBEDDING_MODEL = os.environ.get("GROQ_EMBEDDING_MODEL", "nomic-embed-text-v1_5")
-EMBEDDING_DIMENSION = 768  # unchanged — no Supabase pgvector migration needed
+# ── OpenAI Connection (Embeddings only) ─────────────────────────────────────
+_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+_openai_client = OpenAI(api_key=_OPENAI_API_KEY) if _OPENAI_API_KEY else None
+EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+EMBEDDING_DIMENSION = 768  # matches existing Supabase pgvector column — do not change without a migration
 
 
-# ── Embedding Functions (Groq Cloud) ────────────────────────────────────────
+# ── Embedding Functions (OpenAI) ────────────────────────────────────────────
 #
-# nomic-embed-text expects a task-instruction prefix on the raw text:
-#   "search_document: <text>"  when embedding chunks to be stored/retrieved
-#   "search_query: <text>"     when embedding an incoming user question
-# This distinction is preserved below, matching the original Ollama behaviour.
+# text-embedding-3-small supports the `dimensions` param to truncate its
+# native 1536-dim output down to a smaller vector (Matryoshka-style), so we
+# request 768 to stay compatible with the existing pgvector schema. Unlike
+# nomic-embed-text, OpenAI's embedding models do not need a task-instruction
+# prefix ("search_document:" / "search_query:") — raw text is passed as-is.
 
-def _require_groq_client() -> Groq:
-    if not _groq_client:
-        raise RuntimeError("GROQ_API_KEY is missing from your .env file.")
-    return _groq_client
+def _require_openai_client() -> OpenAI:
+    if not _openai_client:
+        raise RuntimeError(
+            "OPENAI_API_KEY is missing from your .env file (or Render's Environment tab). "
+            "Embeddings cannot be generated without it."
+        )
+    return _openai_client
 
 
 def generate_embedding(text: str) -> list[float]:
     """Generate a 768-dim vector embedding for a single text chunk."""
-    client = _require_groq_client()
+    client = _require_openai_client()
     try:
         response = client.embeddings.create(
-            input=f"search_document: {text}",
+            input=text,
             model=EMBEDDING_MODEL,
+            dimensions=EMBEDDING_DIMENSION,
         )
         return response.data[0].embedding
     except Exception as exc:
-        raise RuntimeError(f"Groq embedding error: {exc}") from exc
+        raise RuntimeError(f"OpenAI embedding error: {exc}") from exc
 
 
 def generate_embeddings_batch(chunks: list[str]) -> list[list[float]]:
@@ -60,30 +72,31 @@ def generate_embeddings_batch(chunks: list[str]) -> list[list[float]]:
     if not chunks:
         return []
 
-    client = _require_groq_client()
-    prefixed_chunks = [f"search_document: {chunk}" for chunk in chunks]
+    client = _require_openai_client()
 
     try:
         response = client.embeddings.create(
-            input=prefixed_chunks,
+            input=chunks,
             model=EMBEDDING_MODEL,
+            dimensions=EMBEDDING_DIMENSION,
         )
         return [item.embedding for item in response.data]
     except Exception as exc:
-        raise RuntimeError(f"Groq batch embedding error: {exc}") from exc
+        raise RuntimeError(f"OpenAI batch embedding error: {exc}") from exc
 
 
 def generate_query_embedding(query: str) -> list[float]:
     """Generate an embedding vector for a user search query."""
-    client = _require_groq_client()
+    client = _require_openai_client()
     try:
         response = client.embeddings.create(
-            input=f"search_query: {query}",
+            input=query,
             model=EMBEDDING_MODEL,
+            dimensions=EMBEDDING_DIMENSION,
         )
         return response.data[0].embedding
     except Exception as exc:
-        raise RuntimeError(f"Groq query embedding error: {exc}") from exc
+        raise RuntimeError(f"OpenAI query embedding error: {exc}") from exc
 
 
 # ── PDF Summarisation (Groq API) ───────────────────────────────────────────

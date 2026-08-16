@@ -38,6 +38,7 @@ export default function AuthPage() {
           password,
           options: {
             data: { full_name: name.trim() || email.split("@")[0] },
+            emailRedirectTo: `${window.location.origin}/auth`,
           },
         });
         if (error) throw error;

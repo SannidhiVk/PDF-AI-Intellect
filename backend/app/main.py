@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
         "SUPABASE_URL": os.environ.get("SUPABASE_URL", "").strip(),
         "SUPABASE_KEY": os.environ.get("SUPABASE_KEY", "").strip(),
         "GROQ_API_KEY": os.environ.get("GROQ_API_KEY", "").strip(),
+        "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "").strip(),
     }
 
     missing = [name for name, val in required_vars.items() if not val]
@@ -56,8 +57,9 @@ async def lifespan(app: FastAPI):
     print(f"     SUPABASE_URL   → {required_vars['SUPABASE_URL']}")
     print(f"     SUPABASE_KEY   → {_mask(required_vars['SUPABASE_KEY'])}")
     print(f"     GROQ_API_KEY   → {_mask(required_vars['GROQ_API_KEY'])}")
+    print(f"     OPENAI_API_KEY → {_mask(required_vars['OPENAI_API_KEY'])}")
 
-    print("✅ Embeddings: using Groq Cloud (nomic-embed-text-v1_5) — no local Ollama required")
+    print("✅ Embeddings: using OpenAI API (text-embedding-3-small, 768 dims)")
 
     yield
 
@@ -71,8 +73,8 @@ app = FastAPI(
     description=(
         "A FastAPI backend for uploading PDFs, generating AI summaries, "
         "and chatting with document content using Groq Cloud API "
-        "(llama-3.3-70b-versatile for chat/summaries, nomic-embed-text-v1_5 for embeddings) "
-        "and Supabase pgvector."
+        "(llama-3.3-70b-versatile for chat/summaries) and OpenAI API "
+        "(text-embedding-3-small for 768-dim embeddings) with Supabase pgvector."
     ),
     version="1.0.0",
     lifespan=lifespan,
