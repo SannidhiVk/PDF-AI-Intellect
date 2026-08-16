@@ -98,9 +98,9 @@ CREATE POLICY "Users can insert chunks for their own documents"
 -- It returns the top `match_count` chunks for a given document,
 -- ordered by cosine similarity (highest first).
 CREATE OR REPLACE FUNCTION match_document_chunks(
-    query_embedding   vector(768),
-    match_document_id UUID,
-    match_count       INT DEFAULT 5
+    query_embedding    vector(768),
+    filter_document_id UUID,
+    match_count        INT DEFAULT 5
 )
 RETURNS TABLE (
     id          UUID,
@@ -108,18 +108,26 @@ RETURNS TABLE (
     content     TEXT,
     similarity  FLOAT
 )
-LANGUAGE sql STABLE
+LANGUAGE plpgsql VOLATILE
 AS $$
-    SELECT
-        dc.id,
-        dc.document_id,
-        dc.content,
-        -- cosine similarity = 1 - cosine distance
-        1 - (dc.embedding <=> query_embedding) AS similarity
-    FROM document_chunks dc
-    WHERE dc.document_id = match_document_id
-    ORDER BY dc.embedding <=> query_embedding  -- ascending distance = descending similarity
-    LIMIT match_count;
+BEGIN
+    -- Increase probe count so the IVFFlat index searches more clusters.
+    -- Default probes=1 means only 1 cluster is checked, which misses nearly
+    -- everything on small datasets (the index has lists=100 but a single PDF
+    -- may only contribute 10-30 chunks, all in one cluster).
+    SET LOCAL ivfflat.probes = 10;
+
+    RETURN QUERY
+        SELECT
+            dc.id,
+            dc.document_id,
+            dc.content,
+            1 - (dc.embedding <=> query_embedding) AS similarity
+        FROM document_chunks dc
+        WHERE dc.document_id = filter_document_id
+        ORDER BY dc.embedding <=> query_embedding
+        LIMIT match_count;
+END;
 $$;
 
 
