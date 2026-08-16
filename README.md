@@ -8,7 +8,7 @@
 
 ### 🎯 Core Capabilities
 - **🔐 User Signup & Authentication**: Secure registration and sign-in powered by Supabase Auth (JWT), with full password hashing and session management.
-- **📄 Intelligent PDF Processing**: Automatic text extraction (`PyMuPDF`), token-aware chunking (`langchain`), and local vector embedding generation (`nomic-embed-text` via Ollama).
+- **📄 Intelligent PDF Processing**: Automatic text extraction (`PyMuPDF`), token-aware chunking (`langchain`), and vector embedding generation via Google Gemini API (`gemini-embedding-001`).
 - **📊 Executive AI Summaries**: Auto-generated structured summaries powered by Groq Cloud API (`llama-3.3-70b-versatile`), complete with key takeaways, topics, metrics, and markdown formatting.
 - **💬 Grounded RAG Chat (Q&A)**: Ask complex questions about any document. Answers are strictly grounded in document context via cosine similarity search on Supabase `pgvector`, eliminating AI hallucinations.
 - **🔍 Document Management & Search**: Real-time filename filtering, multi-document switching, and single-click document deletion with automatic database cleanup.
@@ -35,8 +35,8 @@
          │                   │                   │                   │
          ▼                   ▼                   ▼                   ▼
 ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-│ Groq Cloud API │  │ Ollama (Local) │  │    Supabase    │  │   Brevo API    │
-│ (Llama 3.3 70B)│  │ (nomic-embed)  │  │ (Postgres/RLS/ │  │(Email Invites) │
+│ Groq Cloud API │  │ Google Gemini  │  │    Supabase    │  │   Brevo API    │
+│ (Llama 3.3 70B)│  │(embedding-001) │  │ (Postgres/RLS/ │  │(Email Invites) │
 │ Summaries & RAG│  │ 768d Vector Embed │ pgvector DB)   │  │                │
 └────────────────┘  └────────────────┘  └────────────────┘  └────────────────┘
 ```
@@ -46,7 +46,7 @@
 | **Frontend** | Next.js 15, TypeScript, Tailwind CSS | Modern dark glassmorphism dashboard UI |
 | **Backend API** | FastAPI, Uvicorn, Pydantic | Asynchronous REST backend & RAG pipeline |
 | **LLM Provider** | Groq Cloud API (`llama-3.3-70b-versatile`) | Ultra-fast summary & grounded RAG answer generation |
-| **Vector Embeddings** | Ollama (`nomic-embed-text`) | Local 768-dimensional document and query embeddings |
+| **Vector Embeddings** | Google Gemini (`gemini-embedding-001`) | 768-dimensional document and query embeddings |
 | **Database & Vector Store**| Supabase (PostgreSQL + `pgvector`) | Relational storage, user auth, and vector search |
 | **Email Service** | Brevo API | Transactional email invitations |
 
@@ -61,7 +61,7 @@ Follow this guide to get PDF Intellect up and running locally from scratch.
 Ensure you have the following installed on your machine:
 1. **Node.js**: v18.0.0 or higher ([Download Node.js](https://nodejs.org/))
 2. **Python**: v3.10.0 or higher ([Download Python](https://www.python.org/))
-3. **Ollama**: Download and install Ollama from [ollama.com](https://ollama.com/)
+3. **Google Gemini API Key**: Free API key from [aistudio.google.com](https://aistudio.google.com/)
 4. **Supabase Account**: Free account at [supabase.com](https://supabase.com)
 5. **Groq Cloud API Key**: Free API key from [console.groq.com](https://console.groq.com/)
 6. **Brevo API Key** *(For email invitations to any email address)*: Free API key from [brevo.com](https://brevo.com/)
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS public.documents (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. Document chunks table (768-dimensional embeddings from nomic-embed-text)
+-- 3. Document chunks table (768-dimensional embeddings from gemini-embedding-001)
 CREATE TABLE IF NOT EXISTS public.document_chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
@@ -174,17 +174,11 @@ CREATE POLICY "Users can manage own document chunks" ON public.document_chunks
 
 ---
 
-### Step 2: Install & Start Ollama Embedding Model
+### Step 2: Obtain Google Gemini API Key
 
-Open your terminal and run:
-
-```bash
-# Pull the nomic-embed-text embedding model
-ollama pull nomic-embed-text
-
-# Ensure the Ollama service is running (default port 11434)
-ollama serve
-```
+1. Sign in to [Google AI Studio](https://aistudio.google.com/).
+2. Create an API key for Google Gemini.
+3. Save the API key to use as `GEMINI_API_KEY` in your environment.
 
 ---
 
@@ -226,9 +220,9 @@ SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_KEY=your_anon_public_key_here
 SUPABASE_SERVICE_KEY=your_service_role_key_here
 
-# ── Ollama Local Embeddings ──
-OLLAMA_HOST=http://127.0.0.1:11434
-OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+# ── Google Gemini Embeddings ──
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 
 # ── Brevo Email Invitations ──
 BREVO_API_KEY=xkeysib_your_brevo_api_key_here
@@ -310,7 +304,7 @@ PDF AI-assistent/
 │   │   ├── config.py            # Environment variable validation
 │   │   ├── main.py              # FastAPI endpoints & lifespan handlers
 │   │   └── services/
-│   │       ├── ai_service.py    # Groq LLM (Summary/RAG) & Ollama Embeddings
+│   │       ├── ai_service.py    # Groq LLM (Summary/RAG) & Gemini Embeddings
 │   │       ├── db_service.py    # Supabase DB operations (Service Role Client)
 │   │       └── pdf_service.py   # PyMuPDF text extraction & LangChain chunking
 │   ├── .env                     # Backend environment secrets

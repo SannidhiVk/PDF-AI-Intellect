@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Groq Cloud LLM
     groq_api_key: str
 
+    # Google Gemini Embeddings
+    gemini_api_key: str
+
     # Supabase
     supabase_url: str
     supabase_key: str
