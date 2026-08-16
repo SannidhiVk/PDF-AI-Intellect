@@ -57,19 +57,7 @@ async def lifespan(app: FastAPI):
     print(f"     SUPABASE_KEY   → {_mask(required_vars['SUPABASE_KEY'])}")
     print(f"     GROQ_API_KEY   → {_mask(required_vars['GROQ_API_KEY'])}")
 
-    # ── Ollama connectivity check (for local embeddings) ─────────────────────
-    try:
-        import httpx
-        ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-        with httpx.Client(timeout=2.0) as http_client:
-            http_client.get(f"{ollama_host}/api/tags")
-        print(f"✅ Ollama reachable at {ollama_host} (used for nomic-embed-text)")
-    except Exception:
-        ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-        print(
-            f"⚠️ Ollama not reachable at {ollama_host}. "
-            "Start the Ollama app before uploading PDFs (required for text embeddings)."
-        )
+    print("✅ Embeddings: using Groq Cloud (nomic-embed-text-v1_5) — no local Ollama required")
 
     yield
 
@@ -82,8 +70,9 @@ app = FastAPI(
     title="PDF AI Assistant API",
     description=(
         "A FastAPI backend for uploading PDFs, generating AI summaries, "
-        "and chatting with document content using Groq Cloud API (llama-3.3-70b-versatile), "
-        "local Ollama embeddings (nomic-embed-text), and Supabase pgvector."
+        "and chatting with document content using Groq Cloud API "
+        "(llama-3.3-70b-versatile for chat/summaries, nomic-embed-text-v1_5 for embeddings) "
+        "and Supabase pgvector."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -91,9 +80,16 @@ app = FastAPI(
 
 # ── CORS ───────────────────────────────────────────────────────────────────────
 
+_frontend_url = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
+_allowed_origins = list(filter(None, [
+    "http://localhost:3000",          # always allow local dev
+    "http://127.0.0.1:3000",          # alternate local dev address
+    _frontend_url if _frontend_url else None,  # production Vercel URL
+]))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],   # Next.js dev server
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -243,13 +239,13 @@ async def process_pdf(
             detail=str(exc),
         )
 
-    # Local Ollama embedding generation
+    # Groq Cloud embedding generation
     try:
         embeddings = ai_service.generate_embeddings_batch(chunks)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Ollama embedding generation failed: {exc}",
+            detail=f"Groq embedding generation failed: {exc}",
         )
 
     # Groq API summary generation

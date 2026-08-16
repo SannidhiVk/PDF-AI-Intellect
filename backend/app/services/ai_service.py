@@ -1,75 +1,89 @@
 """
 ai_service.py
 -------------
-Wraps all LLM interactions:
-  - Local Ollama model (`nomic-embed-text`) for 768-dimensional vector embeddings.
+Wraps all LLM interactions — all via Groq Cloud API:
+  - Groq embeddings (`nomic-embed-text-v1_5`) for 768-dimensional vector embeddings.
   - Groq Cloud API (`llama-3.3-70b-versatile`) for fast AI Summaries and RAG Chat.
+
+Note: This service no longer depends on a local Ollama instance. Embeddings are
+generated via Groq's cloud embeddings endpoint, which is required for deployment
+on Render (or any environment without a local Ollama daemon).
 """
 
 import os
 import textwrap
 
-import ollama
 from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 load_dotenv("backend/.env")
 
-# ── Ollama Connection (For Local Embeddings) ───────────────────────────────
-_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-_ollama_client = ollama.Client(host=_OLLAMA_HOST)
-
-EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-EMBEDDING_DIMENSION = 768
-
-
-def _unload_embedding_model(model: str) -> None:
-    """Unload local embedding model from RAM after usage."""
-    try:
-        _ollama_client.generate(model=model, prompt="", keep_alive=0)
-    except Exception:
-        pass
-
-
-# ── Groq Connection (For Summaries & RAG Chat) ─────────────────────────────
+# ── Groq Connection (For Embeddings, Summaries & RAG Chat) ─────────────────
 _GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 _groq_client = Groq(api_key=_GROQ_API_KEY) if _GROQ_API_KEY else None
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
+# ── Embedding Model (Groq Cloud — replaces local Ollama) ───────────────────
+EMBEDDING_MODEL = os.environ.get("GROQ_EMBEDDING_MODEL", "nomic-embed-text-v1_5")
+EMBEDDING_DIMENSION = 768  # unchanged — no Supabase pgvector migration needed
 
-# ── Embedding Functions (Local Ollama) ─────────────────────────────────────
+
+# ── Embedding Functions (Groq Cloud) ────────────────────────────────────────
+#
+# nomic-embed-text expects a task-instruction prefix on the raw text:
+#   "search_document: <text>"  when embedding chunks to be stored/retrieved
+#   "search_query: <text>"     when embedding an incoming user question
+# This distinction is preserved below, matching the original Ollama behaviour.
+
+def _require_groq_client() -> Groq:
+    if not _groq_client:
+        raise RuntimeError("GROQ_API_KEY is missing from your .env file.")
+    return _groq_client
+
 
 def generate_embedding(text: str) -> list[float]:
     """Generate a 768-dim vector embedding for a single text chunk."""
+    client = _require_groq_client()
     try:
-        response = _ollama_client.embeddings(
+        response = client.embeddings.create(
+            input=f"search_document: {text}",
             model=EMBEDDING_MODEL,
-            prompt=f"search_document: {text}",
         )
-        return response["embedding"]
+        return response.data[0].embedding
     except Exception as exc:
-        raise RuntimeError(f"Ollama embedding error: {exc}") from exc
+        raise RuntimeError(f"Groq embedding error: {exc}") from exc
 
 
 def generate_embeddings_batch(chunks: list[str]) -> list[list[float]]:
-    """Generate embeddings for a list of text chunks sequentially."""
-    embeddings = [generate_embedding(chunk) for chunk in chunks]
-    _unload_embedding_model(EMBEDDING_MODEL)
-    return embeddings
+    """Generate embeddings for a list of text chunks in a single batched call."""
+    if not chunks:
+        return []
+
+    client = _require_groq_client()
+    prefixed_chunks = [f"search_document: {chunk}" for chunk in chunks]
+
+    try:
+        response = client.embeddings.create(
+            input=prefixed_chunks,
+            model=EMBEDDING_MODEL,
+        )
+        return [item.embedding for item in response.data]
+    except Exception as exc:
+        raise RuntimeError(f"Groq batch embedding error: {exc}") from exc
 
 
 def generate_query_embedding(query: str) -> list[float]:
     """Generate an embedding vector for a user search query."""
+    client = _require_groq_client()
     try:
-        response = _ollama_client.embeddings(
+        response = client.embeddings.create(
+            input=f"search_query: {query}",
             model=EMBEDDING_MODEL,
-            prompt=f"search_query: {query}",
         )
-        _unload_embedding_model(EMBEDDING_MODEL)
-        return response["embedding"]
+        return response.data[0].embedding
     except Exception as exc:
-        raise RuntimeError(f"Ollama query embedding error: {exc}") from exc
+        raise RuntimeError(f"Groq query embedding error: {exc}") from exc
 
 
 # ── PDF Summarisation (Groq API) ───────────────────────────────────────────
