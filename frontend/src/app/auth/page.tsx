@@ -215,7 +215,7 @@ export default function AuthPage() {
                   <input
                     id="auth-password"
                     type="password"
-                    required={mode !== "reset"}
+                    required
                     autoComplete={mode === "signup" ? "new-password" : "current-password"}
                     minLength={6}
                     value={password}
