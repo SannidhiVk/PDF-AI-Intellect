@@ -9,7 +9,7 @@
 ### 🎯 Core Capabilities
 - **🔐 User Signup & Authentication**: Secure registration and sign-in powered by Supabase Auth (JWT), with full password hashing and session management.
 - **📄 Intelligent PDF Processing**: Automatic text extraction (`PyMuPDF`), token-aware chunking (`langchain`), and vector embedding generation via Google Gemini API (`gemini-embedding-001`).
-- **📊 Executive AI Summaries**: Auto-generated structured summaries powered by Groq Cloud API (`llama-3.3-70b-versatile`), complete with key takeaways, topics, metrics, and markdown formatting.
+- **📊 Executive AI Summaries**: Auto-generated structured summaries powered by Groq Cloud API (`openai/gpt-oss-120b`), complete with key takeaways, topics, metrics, and markdown formatting.
 - **💬 Grounded RAG Chat (Q&A)**: Ask complex questions about any document. Answers are strictly grounded in document context via cosine similarity search on Supabase `pgvector`, eliminating AI hallucinations.
 - **🔍 Document Management & Search**: Real-time filename filtering, multi-document switching, and single-click document deletion with automatic database cleanup.
 - **🔗 Shareable Public Links**: Generate unique share tokens for any document allowing read-only access (summary + chat + comments) without requiring guest authentication.
@@ -36,7 +36,7 @@
          ▼                   ▼                   ▼                   ▼
 ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
 │ Groq Cloud API │  │ Google Gemini  │  │    Supabase    │  │   Brevo API    │
-│ (Llama 3.3 70B)│  │(embedding-001) │  │ (Postgres/RLS/ │  │(Email Invites) │
+│(gpt-oss-120b)  │  │(embedding-001) │  │ (Postgres/RLS/ │  │(Email Invites) │
 │ Summaries & RAG│  │ 768d Vector Embed │ pgvector DB)   │  │                │
 └────────────────┘  └────────────────┘  └────────────────┘  └────────────────┘
 ```
@@ -45,7 +45,7 @@
 |---|---|---|
 | **Frontend** | Next.js 15, TypeScript, Tailwind CSS | Modern dark glassmorphism dashboard UI |
 | **Backend API** | FastAPI, Uvicorn, Pydantic | Asynchronous REST backend & RAG pipeline |
-| **LLM Provider** | Groq Cloud API (`llama-3.3-70b-versatile`) | Ultra-fast summary & grounded RAG answer generation |
+| **LLM Provider** | Groq Cloud API (`openai/gpt-oss-120b`) | Ultra-fast summary & grounded RAG answer generation |
 | **Vector Embeddings** | Google Gemini (`gemini-embedding-001`) | 768-dimensional document and query embeddings |
 | **Database & Vector Store**| Supabase (PostgreSQL + `pgvector`) | Relational storage, user auth, and vector search |
 | **Email Service** | Brevo API | Transactional email invitations |
@@ -103,11 +103,14 @@ CREATE TABLE IF NOT EXISTS public.document_chunks (
 CREATE TABLE IF NOT EXISTS public.document_shares (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
+    created_by UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     share_token TEXT NOT NULL UNIQUE DEFAULT encode(gen_random_bytes(16), 'hex'),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_shares_created_by ON public.document_shares(created_by);
 
 -- 5. Threaded document comments table
 CREATE TABLE IF NOT EXISTS public.document_comments (
@@ -165,6 +168,10 @@ CREATE POLICY "Users can manage own document chunks" ON public.document_chunks
             WHERE d.id = document_chunks.document_id AND d.user_id = auth.uid()
         )
     );
+
+CREATE POLICY "Owners can manage their share links" ON public.document_shares
+    FOR ALL USING (auth.uid() = created_by)
+    WITH CHECK (auth.uid() = created_by);
 ```
 
 4. Go to **Project Settings → API** in Supabase and copy:
@@ -212,7 +219,7 @@ pip install -r requirements.txt
 
 ```env
 # ── Groq API Configuration ──
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 GROQ_API_KEY=gsk_your_groq_api_key_here
 
 # ── Supabase Configuration ──

@@ -7,6 +7,9 @@ Handles all PDF-related operations:
     RecursiveCharacterTextSplitter, ready for embedding.
 """
 
+import re
+from dataclasses import dataclass, field
+
 import fitz  # PyMuPDF
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -23,8 +26,35 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # SINGLE chunk whenever possible, which sidesteps this class of bug entirely
 # for the common case. Larger documents will still be split as expected —
 # this only changes the split point, not whether large documents get chunked.
-CHUNK_SIZE = 2000       # characters per chunk
+#
+# CHUNK_SIZE / CHUNK_OVERLAP are now only used as the FALLBACK for oversized
+# sections — see split_text_into_chunks() below. The primary split strategy
+# is document-aware (structural), which fixes character-splitters cutting
+# straight through legal clauses/paragraphs on documents like contracts.
+CHUNK_SIZE = 2000       # characters per chunk (fallback pass only)
 CHUNK_OVERLAP = 200     # overlapping characters between consecutive chunks
+
+# Matches common legal document structure markers: ARTICLE headers,
+# Section n.n headers, and numbered clause titles. Extend this per contract
+# type as needed (NDAs, MSAs, leases, etc. all vary slightly in formatting).
+_STRUCTURE_PATTERN = re.compile(
+    r"""
+    (?=
+        ^\s*ARTICLE\s+[IVXLC\d]+.*$   |   # ARTICLE I / ARTICLE 2
+        ^\s*Section\s+\d+(\.\d+)*.*$  |   # Section 1 / Section 1.2
+        ^\s*\d+\.\d+\s+[A-Z].*$       |   # 1.2 Clause Title
+        ^\s*\d+\.\s+[A-Z][^\n]{0,80}$     # 1. Clause Title
+    )
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+
+
+@dataclass
+class Chunk:
+    """A single text chunk with metadata describing how it was produced."""
+    text: str
+    metadata: dict = field(default_factory=dict)
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -130,27 +160,51 @@ def assess_extraction_quality(text: str) -> dict:
     return {"is_likely_garbled": False, "reason": None}
 
 
-def split_text_into_chunks(text: str) -> list[str]:
+def split_text_into_chunks(text: str, source_filename: str = "") -> list[Chunk]:
     """
-    Split a large block of text into overlapping chunks suitable for embedding.
+    Split text into chunks using a document-aware strategy, with a
+    size-based recursive fallback for oversized sections.
 
-    Uses RecursiveCharacterTextSplitter, which intelligently splits on
-    paragraph boundaries → sentence boundaries → word boundaries, ensuring
-    chunks are semantically coherent.
+    Pass 1 (structural): splits at legal document boundaries (ARTICLE,
+    Section n.n, numbered clauses) so a clause/paragraph stays intact —
+    this is what fixes character-splitters cutting straight through
+    contract clauses. Falls back to "\n\n" paragraph breaks if no
+    structural markers exist in the document at all (e.g. resumes,
+    memos, non-legal documents).
+
+    Pass 2 (recursive fallback): any structural section still longer
+    than CHUNK_SIZE gets broken down further via
+    RecursiveCharacterTextSplitter (paragraph → sentence → word →
+    character priority), so no single chunk ever exceeds the size
+    limit. This only runs for oversized sections, not every chunk.
 
     Args:
         text: The full extracted text from the PDF.
+        source_filename: Original filename, stored in each chunk's
+                          metadata for citation/debugging purposes.
 
     Returns:
-        A list of text chunk strings.
+        A list of Chunk objects (text + metadata: source, section_index,
+        split_method, and sub_chunk_index when the fallback was used).
 
     Raises:
-        ValueError: If the input text is empty or only whitespace.
+        ValueError: If the input text is empty or only whitespace, or if
+                    splitting produced no chunks.
     """
     if not text or not text.strip():
         raise ValueError("Cannot split empty text into chunks.")
 
-    splitter = RecursiveCharacterTextSplitter(
+    sections = _STRUCTURE_PATTERN.split(text)
+    sections = [s.strip() for s in sections if s and s.strip()]
+
+    if len(sections) <= 1:
+        # No legal structure detected — fall back to paragraph breaks
+        sections = [s.strip() for s in text.split("\n\n") if s.strip()]
+
+    if not sections:
+        raise ValueError("Text splitting produced no chunks.")
+
+    fallback_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         # Split priority: paragraph → sentence → word → character
@@ -158,7 +212,29 @@ def split_text_into_chunks(text: str) -> list[str]:
         length_function=len,
     )
 
-    chunks = splitter.split_text(text)
+    chunks: list[Chunk] = []
+    for idx, section in enumerate(sections):
+        if len(section) <= CHUNK_SIZE:
+            chunks.append(Chunk(
+                text=section,
+                metadata={
+                    "source": source_filename,
+                    "section_index": idx,
+                    "split_method": "structural",
+                },
+            ))
+        else:
+            sub_chunks = fallback_splitter.split_text(section)
+            for sub_idx, sub in enumerate(sub_chunks):
+                chunks.append(Chunk(
+                    text=sub,
+                    metadata={
+                        "source": source_filename,
+                        "section_index": idx,
+                        "sub_chunk_index": sub_idx,
+                        "split_method": "recursive_fallback",
+                    },
+                ))
 
     if not chunks:
         raise ValueError("Text splitting produced no chunks.")

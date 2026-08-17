@@ -234,16 +234,21 @@ async def process_pdf(
         )
 
     try:
-        chunks = pdf_service.split_text_into_chunks(raw_text)
+        chunk_objects = pdf_service.split_text_into_chunks(
+            raw_text, source_filename=file.filename or "unknown.pdf"
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
 
+    chunk_texts = [c.text for c in chunk_objects]
+    chunk_metadatas = [c.metadata for c in chunk_objects]
+
     # Gemini embedding generation
     try:
-        embeddings = ai_service.generate_embeddings_batch(chunks)
+        embeddings = ai_service.generate_embeddings_batch(chunk_texts)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -271,10 +276,11 @@ async def process_pdf(
 
         db_service.store_document_chunks(
             document_id=document_id,
-            chunks=chunks,
+            chunks=chunk_texts,
             embeddings=embeddings,
+            metadatas=chunk_metadatas,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database operation failed: {exc}",
@@ -283,7 +289,7 @@ async def process_pdf(
     return ProcessPdfResponse(
         document_id=document_id,
         file_name=file.filename or "unknown.pdf",
-        chunk_count=len(chunks),
+        chunk_count=len(chunk_objects),
         summary=summary,
         message="PDF processed and stored successfully.",
     )

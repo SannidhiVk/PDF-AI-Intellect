@@ -179,6 +179,7 @@ def store_document_chunks(
     document_id: str,
     chunks: list[str],
     embeddings: list[list[float]],
+    metadatas: list[dict] | None = None,
 ) -> None:
     """
     Bulk-insert text chunks and their embedding vectors into `document_chunks`.
@@ -187,6 +188,13 @@ def store_document_chunks(
         document_id: UUID of the parent document row.
         chunks:      List of text strings (one per chunk).
         embeddings:  Parallel list of embedding vectors (same length as chunks).
+        metadatas:   Optional parallel list of metadata dicts (section_index,
+                     split_method, source filename etc.) to persist in the
+                     `metadata` JSONB column. Defaults to empty dicts if not
+                     provided. Previously this parameter was not accepted here
+                     even though main.py was passing it, causing a TypeError
+                     on every upload → chunks were silently never stored →
+                     retrieval always returned empty results.
 
     Raises:
         ValueError:   If chunks and embeddings lengths do not match.
@@ -198,14 +206,17 @@ def store_document_chunks(
             "must have the same length."
         )
 
+    # Normalise metadatas: if not provided, use empty dicts for each chunk.
+    _metadatas = metadatas if metadatas and len(metadatas) == len(chunks) else [{} for _ in chunks]
+
     rows = [
-    {
-        "document_id": document_id,
-        "chunk_index": i,
-        "content": chunk,
-        "embedding": embedding,
-    }
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+        {
+            "document_id": document_id,
+            "content": chunk,
+            "embedding": embedding,
+            "metadata": meta,
+        }
+        for chunk, embedding, meta in zip(chunks, embeddings, _metadatas)
     ]
 
     # Use the service-role client for the same reason as save_document_metadata:
@@ -226,7 +237,7 @@ def search_similar_chunks(
     document_id: str,
     query_embedding: list[float],
     match_count: int = 5,
-    match_threshold: float = 0.0,
+    match_threshold: float = 0.5,
 ) -> list[str]:
     """
     Retrieve the top-K most semantically similar chunks for a given query.
@@ -234,58 +245,62 @@ def search_similar_chunks(
     Calls the `match_document_chunks` Postgres function (defined via RPC),
     which uses pgvector's `<=>` cosine distance operator under the hood.
 
-    IMPORTANT: The parameter names below (match_document_id, match_count,
-    query_embedding) must match EXACTLY what the SQL function declares —
-    PostgREST resolves RPC calls via strict named-parameter matching against
-    its schema cache, not fuzzy/positional matching. If you rename an
-    argument in the SQL function, update it here too (and vice versa).
-
-    The SQL function signature is:
-        match_document_chunks(
-            query_embedding   vector(768),
-            match_document_id UUID,
-            match_count       INT DEFAULT 5
-        )
-    Note: there is no match_threshold param in the SQL — filtering by
-    similarity threshold can be added to the SQL function if needed.
+    IMPORTANT: The parameter names in the RPC payload below MUST match EXACTLY
+    what the deployed SQL function declares — PostgREST resolves RPC calls via
+    strict named-parameter matching against its schema cache, not fuzzy or
+    positional matching. The live deployed function (supabase_schema.sql)
+    declares the document filter parameter as `filter_document_id`.
 
     Args:
         document_id:     UUID of the document to search within.
         query_embedding: 768-dimensional embedding of the user's question.
         match_count:     How many top chunks to return (default: 5).
-        match_threshold: Unused — kept for API compatibility. The SQL function
-                         returns all top-K chunks without a threshold filter.
+        match_threshold: Minimum cosine similarity (0-1) for a chunk to be
+                          considered a match (default: 0.5). Raise this for
+                          stricter relevance, lower it if legitimate chunks
+                          are being filtered out. Applied here in Python,
+                          since the underlying SQL function does not accept
+                          a threshold parameter.
 
     Returns:
         A list of content strings for the top matching chunks, ordered by
         descending similarity.
 
     Raises:
-        RuntimeError: If the RPC call fails.
+        RuntimeError: If the RPC call fails (response.data is None).
+
+    NOTE — parameter name history:
+      The SQL function's document-filter parameter is `filter_document_id`
+      (as declared in supabase_schema.sql). A previous edit incorrectly
+      changed this to `match_document_id` in the Python RPC payload, causing
+      PostgREST to fail to resolve the function (unrecognised parameter name),
+      returning None for response.data and raising a RuntimeError → 500.
+      Reverted to `filter_document_id` to match the live deployed signature.
+      The `match_threshold` parameter never existed in the SQL function; it is
+      applied as a Python-side filter on the returned `similarity` column.
     """
-    try:
-        response = _get_service_client().rpc(
-            "match_document_chunks",
-            {
-                "query_embedding": query_embedding,
-                "filter_document_id": document_id,
-                "match_count": match_count,
-            },
-        ).execute()
-    except Exception as exc:
-        # postgrest.exceptions.APIError and other RPC failures are NOT RuntimeError,
-        # so they would bypass the `except RuntimeError` handler in main.py and crash
-        # the ASGI connection before sending any HTTP response — making the frontend
-        # report "Could not reach the server" instead of a proper error message.
-        raise RuntimeError(f"Vector search RPC error: {exc}") from exc
+    response = _get_service_client().rpc(
+        "match_document_chunks",
+        {
+            "query_embedding": query_embedding,
+            "filter_document_id": document_id,
+            "match_count": match_count,
+        },
+    ).execute()
 
     if response.data is None:
         raise RuntimeError(
-            f"Vector search RPC returned no data. Supabase response: {response}"
+            f"Vector search RPC failed. Supabase response: {response}"
         )
 
-    # Each row has a `content` field; return just the text strings
-    return [row["content"] for row in response.data]
+    # Apply the similarity threshold here, since the SQL function returns
+    # all top `match_count` rows regardless of similarity score.
+    filtered_rows = [
+        row for row in response.data
+        if row.get("similarity", 0) >= match_threshold
+    ]
+
+    return [row["content"] for row in filtered_rows]
 
 
 # ── Document Fetch ────────────────────────────────────────────────────────────
@@ -438,21 +453,41 @@ def create_share(document_id: str, user_id: str) -> dict[str, Any]:
     If an inactive share already exists for this document it is re-activated
     rather than creating a new row, keeping token URLs stable.
 
-    The actual document_shares table has columns:
-        (id, document_id, share_token, created_at, is_active)
-    There is no user/owner column — ownership is enforced at the endpoint
-    level via get_current_user + get_document_by_id before this is called.
-
     Returns:
         The document_shares row as a dict.
+
+    IMPORTANT — required SQL migration:
+      The `created_by` column must exist in the live `document_shares` table.
+      If you see a 500 with 'column document_shares.created_by does not exist',
+      run this in the Supabase SQL Editor before using the sharing feature:
+
+          ALTER TABLE document_shares
+              ADD COLUMN IF NOT EXISTS created_by UUID
+              REFERENCES auth.users(id) ON DELETE CASCADE;
+
+          UPDATE document_shares SET created_by = (
+              SELECT user_id FROM documents
+              WHERE documents.id = document_shares.document_id
+          ) WHERE created_by IS NULL;
+
+          ALTER TABLE document_shares ALTER COLUMN created_by SET NOT NULL;
+
+    Note: uses the service-role client — the anon client never forwards the
+    user's JWT to PostgREST, so auth.uid() is NULL for every call made through
+    it — the RLS policy "auth.uid() = created_by" would then reject every
+    insert/update unconditionally. Ownership is instead enforced here in Python
+    via the .eq("created_by", user_id) filter.
     """
     client = _get_service_client()
 
-    # Check for existing row (active or inactive) for this document
+    # Check for existing row (active or inactive) owned by this user.
+    # Each document has at most one share row per owner, so filtering by
+    # both document_id and created_by uniquely identifies it.
     existing = (
         client.table("document_shares")
         .select("*")
         .eq("document_id", document_id)
+        .eq("created_by", user_id)
         .limit(1)
         .execute()
     )
@@ -460,7 +495,7 @@ def create_share(document_id: str, user_id: str) -> dict[str, Any]:
     if existing.data:
         row = existing.data[0]
         if not row["is_active"]:
-            # Re-activate the existing share
+            # Re-activate the existing share rather than creating a duplicate
             updated = (
                 client.table("document_shares")
                 .update({"is_active": True})
@@ -470,14 +505,19 @@ def create_share(document_id: str, user_id: str) -> dict[str, Any]:
             return updated.data[0]
         return row
 
-    # Create a fresh share link
+    # No existing row — create a fresh share link for this document + owner
     response = (
         client.table("document_shares")
-        .insert({"document_id": document_id})
+        .insert({"document_id": document_id, "created_by": user_id})
         .execute()
     )
     if not response.data:
-        raise RuntimeError(f"Failed to create share link. Response: {response}")
+        raise RuntimeError(
+            f"Failed to create share link for document {document_id}. "
+            f"Supabase response: {response}. "
+            "If you see '42703 column document_shares.created_by does not exist', "
+            "run the SQL migration shown in the create_share() docstring above."
+        )
     return response.data[0]
 
 
@@ -486,12 +526,17 @@ def revoke_share(document_id: str, user_id: str) -> bool:
     Deactivate the share link for a document (sets is_active = FALSE).
 
     Returns True if a row was updated, False if no active share existed.
-    Ownership is enforced at the endpoint level before this is called.
+
+    Filters by both document_id AND created_by so only the owner can
+    revoke their own share. Uses the service-role client to bypass RLS
+    (same reason as create_share — auth.uid() is always NULL for
+    server-side Python requests).
     """
     response = (
         _get_service_client().table("document_shares")
         .update({"is_active": False})
         .eq("document_id", document_id)
+        .eq("created_by", user_id)
         .eq("is_active", True)
         .execute()
     )

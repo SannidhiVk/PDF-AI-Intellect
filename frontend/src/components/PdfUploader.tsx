@@ -76,9 +76,22 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
       } catch (err: unknown) {
         setStatus("error");
         if (axios.isAxiosError(err)) {
-          setErrorMessage(
-            err.response?.data?.detail || "Failed to process the PDF. Please try again."
-          );
+          const detail = err.response?.data?.detail;
+          let msg = "Failed to process the PDF. Please try again.";
+          if (typeof detail === "string") {
+            msg = detail;
+          } else if (Array.isArray(detail)) {
+            msg = detail.map((d: any) => d.msg || JSON.stringify(d)).join(", ");
+          } else if (detail && typeof detail === "object") {
+            msg = JSON.stringify(detail);
+          } else if (err.response?.status === 504) {
+            msg = "Server timed out (30s limit on Render). Please try uploading a smaller PDF.";
+          } else if (err.response?.status === 502) {
+            msg = "Bad Gateway: Backend service error or key mismatch on deployment server.";
+          } else if (!err.response) {
+            msg = `Network Error: Unable to reach backend server at ${FASTAPI_URL}. Verify backend deployment and CORS settings.`;
+          }
+          setErrorMessage(msg);
         } else {
           setErrorMessage("An unexpected error occurred.");
         }

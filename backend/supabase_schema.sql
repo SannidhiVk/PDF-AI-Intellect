@@ -49,11 +49,15 @@ CREATE POLICY "Users can delete their own documents"
 -- ─────────────────────────────────────────────
 -- Stores text chunks and their 768-dimensional Gemini embeddings.
 -- The vector(768) column uses pgvector for cosine similarity search.
+-- Migration 2026-08-17: added metadata JSONB column for chunk provenance
+-- (section_index, split_method, source filename). Run on existing deployments:
+-- ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS document_chunks (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     content     TEXT        NOT NULL,
-    embedding   vector(768) NOT NULL
+    embedding   vector(768) NOT NULL,
+    metadata    JSONB       NOT NULL DEFAULT '{}'
 );
 
 -- Index for fast document-level chunk lookup
