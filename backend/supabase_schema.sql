@@ -115,10 +115,6 @@ RETURNS TABLE (
 LANGUAGE plpgsql VOLATILE
 AS $$
 BEGIN
-    -- Increase probe count so the IVFFlat index searches more clusters.
-    -- Default probes=1 means only 1 cluster is checked, which misses nearly
-    -- everything on small datasets (the index has lists=100 but a single PDF
-    -- may only contribute 10-30 chunks, all in one cluster).
     SET LOCAL ivfflat.probes = 10;
 
     RETURN QUERY
@@ -133,6 +129,43 @@ BEGIN
         LIMIT match_count;
 END;
 $$;
+
+
+-- ─────────────────────────────────────────────
+-- STEP 4b: Multi-document vector similarity search RPC function
+-- ─────────────────────────────────────────────
+-- Same as match_document_chunks but accepts an ARRAY of document UUIDs.
+-- Used by POST /api/chat/multi to search across multiple docs at once.
+CREATE OR REPLACE FUNCTION match_document_chunks_multi(
+    query_embedding     vector(768),
+    filter_document_ids UUID[],
+    match_count         INT DEFAULT 8
+)
+RETURNS TABLE (
+    id          UUID,
+    document_id UUID,
+    content     TEXT,
+    similarity  FLOAT
+)
+LANGUAGE plpgsql VOLATILE
+AS $$
+BEGIN
+    SET LOCAL ivfflat.probes = 10;
+
+    RETURN QUERY
+        SELECT
+            dc.id,
+            dc.document_id,
+            dc.content,
+            1 - (dc.embedding <=> query_embedding) AS similarity
+        FROM document_chunks dc
+        WHERE dc.document_id = ANY(filter_document_ids)
+        ORDER BY dc.embedding <=> query_embedding
+        LIMIT match_count;
+END;
+$$;
+
+
 
 
 -- ─────────────────────────────────────────────
@@ -240,3 +273,34 @@ CREATE POLICY "Document owner can delete any comment"
               AND d.user_id = auth.uid()
         )
     );
+
+
+-- ─────────────────────────────────────────────
+-- STEP 7: Create the `share_chat_messages` table
+-- ─────────────────────────────────────────────
+-- Persists the AI chat conversation for each share link so that all
+-- visitors to the same link see the full conversation history.
+-- share_token is the TEXT representation of the UUID from document_shares.
+-- No user_id column — access is controlled by possessing the share token.
+CREATE TABLE IF NOT EXISTS share_chat_messages (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    share_token TEXT        NOT NULL,
+    role        TEXT        NOT NULL CHECK (role IN ('user', 'assistant')),
+    content     TEXT        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Index for efficiently fetching ordered history per share token
+CREATE INDEX IF NOT EXISTS idx_share_chat_token_time
+    ON share_chat_messages(share_token, created_at ASC);
+
+-- RLS: public access — the share token itself is the access credential
+ALTER TABLE share_chat_messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Anyone can read chat history for a share token"
+    ON share_chat_messages FOR SELECT
+    USING (true);
+
+CREATE POLICY "Anyone can insert messages for a share token"
+    ON share_chat_messages FOR INSERT
+    WITH CHECK (true);

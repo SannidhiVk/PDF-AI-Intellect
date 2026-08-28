@@ -30,6 +30,8 @@ export default function DashboardPage() {
   const [activeView, setActiveView] = useState<ActiveView>("upload");
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
+  // Multi-select: set of doc IDs checked for cross-document chat
+  const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
   const [showSummary, setShowSummary] = useState(false);
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [isFetchingDocs, setIsFetchingDocs] = useState(false);
@@ -130,18 +132,29 @@ export default function DashboardPage() {
           method: "DELETE",
           headers: { Authorization: `Bearer ${authToken}` },
         });
-        if (!res.ok) return; // silently ignore — doc stays in sidebar
+        if (!res.ok) return;
       } catch {
-        return; // network error — leave the list unchanged
+        return;
       }
-      // Remove from local state immediately (no need to refetch)
       setDocuments((prev) => prev.filter((d) => d.id !== id));
-      // If the deleted doc was selected, clear the selection
       setSelectedDocId((prev) => (prev === id ? null : prev));
+      setSelectedDocIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
       setShowSummary((prev) => (selectedDocId === id ? false : prev));
     },
     [authToken, selectedDocId]
   );
+
+  const handleToggleSelect = useCallback((id: string) => {
+    setSelectedDocIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleChatWithSelected = useCallback(() => {
+    setActiveView("chat");
+  }, []);
 
   // Show full-screen spinner while session is being resolved.
   // This early return now happens AFTER all hooks are called, so hook
@@ -154,9 +167,12 @@ export default function DashboardPage() {
     );
   }
 
-  // Get the currently selected document (plain derived value, not a hook —
-  // safe to compute after the guard)
+  // Get the currently selected document
   const selectedDocument = documents.find((d) => d.id === selectedDocId) ?? null;
+  // Documents selected for multi-doc chat
+  const selectedDocumentsForChat = documents.filter((d) => selectedDocIds.has(d.id));
+  // True if multi-doc chat mode is active
+  const isMultiDocMode = selectedDocIds.size >= 2;
 
   const handleSelectHistory = (id: string) => {
     setSelectedDocId(id);
@@ -177,6 +193,9 @@ export default function DashboardPage() {
         onSelectHistory={handleSelectHistory}
         onDeleteDocument={handleDeleteDocument}
         selectedDocumentId={selectedDocId}
+        selectedDocumentIds={selectedDocIds}
+        onToggleSelect={handleToggleSelect}
+        onChatWithSelected={handleChatWithSelected}
         userEmail={user.email ?? ""}
         isLoadingHistory={isFetchingDocs}
       />
@@ -191,7 +210,9 @@ export default function DashboardPage() {
             </h1>
             <p className="text-xs text-gray-500 truncate">
               {activeView === "upload"
-                ? "Upload a PDF to extract insights and AI summaries"
+                ? "Upload PDFs to extract insights and AI summaries"
+                : isMultiDocMode
+                ? `Chatting across ${selectedDocIds.size} documents`
                 : selectedDocument
                 ? `Chatting with: ${selectedDocument.filename}`
                 : "Select a document to begin chatting"}
@@ -235,22 +256,29 @@ export default function DashboardPage() {
             <UploadView
               onSuccess={handleUploadSuccess}
               selectedDocument={selectedDocument}
+              selectedDocuments={isMultiDocMode ? selectedDocumentsForChat : selectedDocument ? [selectedDocument] : []}
               showSummary={showSummary}
               onGoToChat={() => setActiveView("chat")}
               userId={user.id}
               authToken={authToken}
               ownerName={user.email ?? "You"}
+              isMultiDocMode={isMultiDocMode}
             />
           )}
 
-          {activeView === "chat" && selectedDocument ? (
+          {activeView === "chat" && (isMultiDocMode || selectedDocument) ? (
             <div className="h-full" style={{ height: "calc(100vh - 130px)" }}>
               <ChatWindow
-                documentId={selectedDocument.id}
-                filename={selectedDocument.filename}
+                documentId={!isMultiDocMode ? selectedDocument?.id : undefined}
+                documentIds={isMultiDocMode ? Array.from(selectedDocIds) : undefined}
+                filename={
+                  isMultiDocMode
+                    ? `${selectedDocIds.size} documents`
+                    : (selectedDocument?.filename ?? "")
+                }
               />
             </div>
-          ) : activeView === "chat" && !selectedDocument ? (
+          ) : activeView === "chat" && !selectedDocument && !isMultiDocMode ? (
             <EmptyState
               icon={<MessageSquare className="h-12 w-12 text-gray-700" />}
               title="No Document Selected"
@@ -277,18 +305,21 @@ export default function DashboardPage() {
 interface UploadViewProps {
   onSuccess: (data: { document_id: string; summary: string; filename: string }) => void;
   selectedDocument: UploadedDocument | null;
+  /** All documents to show summaries for (1 in single mode, N in multi mode) */
+  selectedDocuments: UploadedDocument[];
   showSummary: boolean;
   onGoToChat: () => void;
   userId: string;
   authToken: string | null;
   ownerName: string;
+  isMultiDocMode: boolean;
 }
 
-function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, userId, authToken, ownerName }: UploadViewProps) {
+function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummary, onGoToChat, userId, authToken, ownerName, isMultiDocMode }: UploadViewProps) {
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       {/* Welcome banner — only shown when no document uploaded */}
-      {!selectedDocument && (
+      {!selectedDocument && !isMultiDocMode && (
         <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-violet-950/60 via-gray-900 to-indigo-950/60 border border-violet-800/30 p-8">
           {/* Background glow */}
           <div className="absolute -top-10 -right-10 h-40 w-40 rounded-full bg-violet-600/10 blur-3xl" />
@@ -330,8 +361,37 @@ function UploadView({ onSuccess, selectedDocument, showSummary, onGoToChat, user
       {/* Uploader */}
       <PdfUploader onSuccess={onSuccess} userId={userId} />
 
-      {/* Summary — shown after upload */}
-      {showSummary && selectedDocument && (
+      {/* Multi-doc stacked summaries */}
+      {isMultiDocMode && selectedDocuments.length > 0 && (
+        <div className="space-y-3 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="flex items-center gap-2 px-1">
+            <Sparkles className="h-4 w-4 text-violet-400" />
+            <p className="text-sm font-semibold text-white">
+              {selectedDocuments.length} Documents Selected
+            </p>
+            <span className="text-xs text-gray-500">— summaries shown below</span>
+          </div>
+
+          {selectedDocuments.map((doc) => (
+            <SummaryView key={doc.id} summary={doc.summary} filename={doc.filename} />
+          ))}
+
+          <div className="flex justify-center pt-2">
+            <button
+              onClick={onGoToChat}
+              id="go-to-chat-btn"
+              className="group flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/30 hover:shadow-violet-900/50 hover:scale-[1.02] transition-all duration-200"
+            >
+              <Sparkles className="h-4 w-4" />
+              Chat across {selectedDocuments.length} Documents
+              <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Single-doc summary — shown after upload */}
+      {!isMultiDocMode && showSummary && selectedDocument && (
         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <SummaryView
             summary={selectedDocument.summary}

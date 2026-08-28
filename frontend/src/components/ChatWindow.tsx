@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
-import { Send, Bot, User, AlertCircle, Trash2, MessageSquare } from "lucide-react";
+import { Send, Bot, User, AlertCircle, Trash2, MessageSquare, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -18,24 +18,87 @@ export interface Message {
 
 interface ChatWindowProps {
   documentId?: string;
+  /** For multi-doc mode: pass 2+ IDs and the chat routes to /api/chat/multi */
+  documentIds?: string[];
   filename: string;
   /** When provided, chats via the public /api/share/{token}/chat endpoint (no auth). */
   shareToken?: string;
 }
 
-export default function ChatWindow({ documentId, filename, shareToken }: ChatWindowProps) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: "welcome",
-      role: "assistant",
-      content: `Hello! I've analyzed **${filename}**. Ask me anything about this document — I'll provide answers based on its content.`,
-      timestamp: new Date(),
-    },
-  ]);
+export default function ChatWindow({ documentId, documentIds, filename, shareToken }: ChatWindowProps) {
+  // Effective doc IDs: prefer explicit documentIds array, fall back to single documentId
+  const effectiveDocIds: string[] =
+    documentIds && documentIds.length > 0
+      ? documentIds
+      : documentId
+      ? [documentId]
+      : [];
+  const isMultiDoc = effectiveDocIds.length > 1;
+
+  const welcomeMessage: Message = {
+    id: "welcome",
+    role: "assistant",
+    content: isMultiDoc
+      ? `Hello! I've analyzed **${effectiveDocIds.length} documents**. Ask me anything — I'll search across all of them to find the best answer.`
+      : `Hello! I've analyzed **${filename}**. Ask me anything about this document — I'll provide answers based on its content.`,
+    timestamp: new Date(),
+  };
+
+  const [messages, setMessages] = useState<Message[]>([welcomeMessage]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  /** true while we're fetching persisted history on first load (share links only) */
+  const [isLoadingHistory, setIsLoadingHistory] = useState(!!shareToken);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── Load persisted share-link chat history on mount ──────────────────────
+  useEffect(() => {
+    if (!shareToken) return;
+
+    let cancelled = false;
+    setIsLoadingHistory(true);
+
+    axios
+      .get<{ id: string; role: "user" | "assistant"; content: string; created_at: string }[]>(
+        `${FASTAPI_URL}/api/share/${shareToken}/chat-history`
+      )
+      .then((res) => {
+        if (cancelled) return;
+        const history = res.data;
+
+        if (history.length === 0) {
+          // No prior conversation — keep the welcome message
+          setMessages([welcomeMessage]);
+        } else {
+          // Restore the full conversation; prepend a static welcome banner
+          const restored: Message[] = [
+            welcomeMessage,
+            ...history.map((row) => ({
+              id: row.id,
+              role: row.role,
+              content: row.content,
+              timestamp: new Date(row.created_at),
+            })),
+          ];
+          setMessages(restored);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // Silently fall back to the welcome message — don't block the chat UI
+        console.warn("[ChatWindow] Could not load share chat history:", err);
+        setMessages([welcomeMessage]);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingHistory(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shareToken]);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -66,7 +129,7 @@ export default function ChatWindow({ documentId, filename, shareToken }: ChatWin
     setIsLoading(true);
 
     try {
-      // Build chat history for backend (exclude welcome message)
+      // Build chat history for backend (exclude welcome message and errors)
       const history = messages
         .filter((m) => m.id !== "welcome" && !m.isError)
         .map((m) => ({ role: m.role, content: m.content }));
@@ -79,6 +142,13 @@ export default function ChatWindow({ documentId, filename, shareToken }: ChatWin
         // Public share-link chat — no auth needed
         endpoint = `${FASTAPI_URL}/api/share/${shareToken}/chat`;
         payload = { question: trimmed, chat_history: history };
+      } else if (isMultiDoc) {
+        // Multi-document RAG chat
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token ?? "";
+        endpoint = `${FASTAPI_URL}/api/chat/multi`;
+        headers["Authorization"] = `Bearer ${token}`;
+        payload = { document_ids: effectiveDocIds, question: trimmed, chat_history: history };
       } else {
         // Authenticated owner/dashboard chat
         const { data: { session } } = await supabase.auth.getSession();
@@ -135,7 +205,7 @@ export default function ChatWindow({ documentId, filename, shareToken }: ChatWin
       setIsLoading(false);
       textareaRef.current?.focus();
     }
-  }, [input, isLoading, messages, documentId]);
+  }, [input, isLoading, messages, documentId, documentIds, shareToken]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -179,7 +249,17 @@ export default function ChatWindow({ documentId, filename, shareToken }: ChatWin
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 min-h-0">
+      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 min-h-0 relative">
+        {/* History loading overlay */}
+        {isLoadingHistory && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-gray-900/80 backdrop-blur-sm animate-in fade-in duration-200">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-gradient-to-br from-violet-600 to-indigo-600 shadow-lg shadow-violet-900/30">
+              <Loader2 className="h-5 w-5 text-white animate-spin" />
+            </div>
+            <p className="text-xs text-gray-400">Loading conversation history…</p>
+          </div>
+        )}
+
         {messages.map((message) => (
           <MessageBubble key={message.id} message={message} />
         ))}
@@ -218,17 +298,17 @@ export default function ChatWindow({ documentId, filename, shareToken }: ChatWin
             onKeyDown={handleKeyDown}
             placeholder="Ask a question about the document..."
             rows={1}
-            disabled={isLoading}
+            disabled={isLoading || isLoadingHistory}
             className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 focus:outline-none disabled:opacity-50 leading-relaxed"
             style={{ minHeight: "24px", maxHeight: "160px" }}
           />
           <button
             onClick={sendMessage}
-            disabled={!input.trim() || isLoading}
+            disabled={!input.trim() || isLoading || isLoadingHistory}
             id="send-message-btn"
             className={cn(
               "flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg transition-all duration-200",
-              input.trim() && !isLoading
+              input.trim() && !isLoading && !isLoadingHistory
                 ? "bg-violet-600 text-white hover:bg-violet-500 shadow-lg shadow-violet-900/30"
                 : "bg-gray-700 text-gray-600 cursor-not-allowed"
             )}

@@ -396,6 +396,102 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
     )
 
 
+# ── Endpoint 3b: Multi-Document Chat (RAG across multiple docs) ───────────────
+
+class MultiChatRequest(BaseModel):
+    document_ids: list[str]
+    question: str
+    chat_history: list[ChatHistoryItem] = []
+
+
+class MultiChatResponse(BaseModel):
+    document_ids: list[str]
+    question: str
+    answer: str
+    sources_used: int
+
+
+@app.post(
+    "/api/chat/multi",
+    response_model=MultiChatResponse,
+    summary="Ask a question across multiple documents (RAG)",
+    tags=["AI"],
+)
+async def chat_multi(body: MultiChatRequest, user_id: str = Depends(get_current_user)):
+    """
+    RAG-based Q&A that retrieves context from multiple documents at once.
+    All document IDs must belong to the authenticated user.
+    """
+    if len(body.document_ids) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one document_id.",
+        )
+    if not body.question.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Question must not be empty.",
+        )
+
+    # Verify ownership of every document ID
+    for doc_id in body.document_ids:
+        doc = db_service.get_document_by_id(doc_id, user_id=user_id)
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {doc_id} not found or you do not have permission to access it.",
+            )
+
+    try:
+        query_embedding = ai_service.generate_query_embedding(body.question)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to generate query embedding: {exc}",
+        )
+
+    # If only one doc, fall back to the single-doc RPC for efficiency
+    try:
+        if len(body.document_ids) == 1:
+            context_chunks = db_service.search_similar_chunks(
+                document_id=body.document_ids[0],
+                query_embedding=query_embedding,
+                match_count=8,
+                match_threshold=0.0,
+            )
+        else:
+            context_chunks = db_service.search_similar_chunks_multi(
+                document_ids=body.document_ids,
+                query_embedding=query_embedding,
+                match_count=8,
+                match_threshold=0.0,
+            )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Vector search failed: {exc}",
+        )
+
+    try:
+        answer = ai_service.generate_rag_answer(
+            question=body.question,
+            context_chunks=context_chunks,
+            chat_history=[h.model_dump() for h in body.chat_history],
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Groq answer generation failed: {exc}",
+        )
+
+    return MultiChatResponse(
+        document_ids=body.document_ids,
+        question=body.question,
+        answer=answer,
+        sources_used=len(context_chunks),
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  SHARE & COMMENTS FEATURE
 # ════════════════════════════════════════════════════════════════════════════
@@ -434,6 +530,47 @@ CommentResponse.model_rebuild()
 class ShareChatRequest(BaseModel):
     question: str
     chat_history: list[ChatHistoryItem] = []
+
+
+class ShareChatHistoryMessage(BaseModel):
+    id: str
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: str
+
+
+@app.get(
+    "/api/share/{token}/chat-history",
+    response_model=list[ShareChatHistoryMessage],
+    summary="Get persisted chat history for a share link (public)",
+    tags=["Sharing"],
+)
+async def get_share_chat_history(token: str):
+    """
+    Returns all saved chat messages for the given share token, ordered
+    oldest-first. Used by the frontend to restore conversation history
+    when the page is (re)loaded.
+    """
+    _get_active_share(token)  # 404 if token invalid / revoked
+
+    try:
+        rows = db_service.get_share_chat_history(token)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+
+    return [
+        ShareChatHistoryMessage(
+            id=row["id"],
+            role=row["role"],
+            content=row["content"],
+            created_at=row["created_at"],
+        )
+        for row in rows
+    ]
+
 
 
 def _get_active_share(token: str) -> dict:
@@ -593,6 +730,18 @@ async def share_chat(token: str, body: ShareChatRequest):
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Groq answer generation failed: {exc}",
         )
+
+    # Persist the Q&A pair so future visitors see the full conversation history.
+    # Non-fatal — a DB failure here should not break the chat response.
+    try:
+        db_service.save_share_chat_messages(
+            share_token=token,
+            user_content=body.question,
+            assistant_content=answer,
+        )
+    except RuntimeError as exc:
+        # Log but don't surface to the caller — the answer was generated fine.
+        print(f"[share_chat] Warning: could not persist chat message: {exc}")
 
     return ChatResponse(
         document_id=document_id,

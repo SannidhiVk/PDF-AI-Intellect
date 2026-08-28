@@ -303,6 +303,59 @@ def search_similar_chunks(
     return [row["content"] for row in filtered_rows]
 
 
+def search_similar_chunks_multi(
+    document_ids: list[str],
+    query_embedding: list[float],
+    match_count: int = 8,
+    match_threshold: float = 0.0,
+) -> list[str]:
+    """
+    Retrieve the top-K most semantically similar chunks across MULTIPLE documents.
+
+    Calls the `match_document_chunks_multi` Postgres RPC which uses
+    `WHERE document_id = ANY(filter_document_ids)` to search all provided
+    documents in a single query, ordered by cosine similarity globally.
+
+    Args:
+        document_ids:    List of document UUIDs to search across.
+        query_embedding: 768-dimensional embedding of the user's question.
+        match_count:     How many top chunks to return globally (default: 8).
+        match_threshold: Minimum cosine similarity (0-1) to include a chunk.
+
+    Returns:
+        A list of content strings for the top matching chunks, ordered by
+        descending similarity, sourced from any of the provided documents.
+
+    Raises:
+        ValueError:   If document_ids is empty.
+        RuntimeError: If the RPC call fails.
+    """
+    if not document_ids:
+        raise ValueError("document_ids must contain at least one ID.")
+
+    response = _get_service_client().rpc(
+        "match_document_chunks_multi",
+        {
+            "query_embedding": query_embedding,
+            "filter_document_ids": document_ids,
+            "match_count": match_count,
+        },
+    ).execute()
+
+    if response.data is None:
+        raise RuntimeError(
+            f"Multi-doc vector search RPC failed. Supabase response: {response}"
+        )
+
+    filtered_rows = [
+        row for row in response.data
+        if row.get("similarity", 0) >= match_threshold
+    ]
+
+    return [row["content"] for row in filtered_rows]
+
+
+
 # ── Document Fetch ────────────────────────────────────────────────────────────
 
 def get_document_by_id(document_id: str, user_id: str | None = None) -> dict[str, Any] | None:
@@ -712,3 +765,62 @@ def owner_delete_comment(comment_id: str, owner_user_id: str) -> bool:
         .execute()
     )
     return bool(response.data)
+
+
+# ── Shared Chat History ────────────────────────────────────────────────────────
+
+def get_share_chat_history(share_token: str) -> list[dict[str, Any]]:
+    """
+    Fetch all persisted chat messages for the given share token, ordered
+    chronologically (oldest first).
+
+    Args:
+        share_token: The UUID string used in the share URL (/share/<token>).
+
+    Returns:
+        A list of dicts, each with keys: id, role, content, created_at.
+        Returns an empty list if no messages exist yet.
+
+    Raises:
+        RuntimeError: If the Supabase query fails.
+    """
+    try:
+        response = (
+            _get_service_client()
+            .table("share_chat_messages")
+            .select("id, role, content, created_at")
+            .eq("share_token", share_token)
+            .order("created_at", desc=False)
+            .execute()
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch share chat history: {exc}") from exc
+
+    return response.data or []
+
+
+def save_share_chat_messages(
+    share_token: str,
+    user_content: str,
+    assistant_content: str,
+) -> None:
+    """
+    Persist a user message and the corresponding AI reply for the given share
+    token. Both are inserted in a single batch call so they appear atomically.
+
+    Args:
+        share_token:       The share link token (UUID string).
+        user_content:      The raw question text submitted by the visitor.
+        assistant_content: The AI-generated answer text.
+
+    Raises:
+        RuntimeError: If the Supabase insert fails.
+    """
+    rows = [
+        {"share_token": share_token, "role": "user",      "content": user_content},
+        {"share_token": share_token, "role": "assistant",  "content": assistant_content},
+    ]
+    try:
+        _get_service_client().table("share_chat_messages").insert(rows).execute()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to save share chat messages: {exc}") from exc

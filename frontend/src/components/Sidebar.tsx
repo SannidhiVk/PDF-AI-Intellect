@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { FileText, MessageSquare, History, LogOut, Brain, ChevronRight, User, Loader2, Trash2, Search, X } from "lucide-react";
+import { FileText, MessageSquare, History, LogOut, Brain, ChevronRight, User, Loader2, Trash2, Search, X, CheckSquare, Square, Layers } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
@@ -14,6 +14,12 @@ interface SidebarProps {
   /** Called when the user confirms deletion of a document. */
   onDeleteDocument: (id: string) => Promise<void>;
   selectedDocumentId: string | null;
+  /** IDs of documents checked for multi-doc chat */
+  selectedDocumentIds: Set<string>;
+  /** Toggle a document in/out of the multi-select set */
+  onToggleSelect: (id: string) => void;
+  /** Called when user clicks "Chat with N docs" */
+  onChatWithSelected: () => void;
   userEmail: string;
   /** When true, show a loading spinner in the history section. */
   isLoadingHistory?: boolean;
@@ -26,6 +32,9 @@ export default function Sidebar({
   onSelectHistory,
   onDeleteDocument,
   selectedDocumentId,
+  selectedDocumentIds,
+  onToggleSelect,
+  onChatWithSelected,
   userEmail,
   isLoadingHistory = false,
 }: SidebarProps) {
@@ -77,11 +86,11 @@ export default function Sidebar({
         />
         <NavButton
           icon={<MessageSquare className="h-4 w-4" />}
-          label="Chat with PDF"
+          label={selectedDocumentIds.size >= 2 ? `Chat (${selectedDocumentIds.size} docs)` : "Chat with PDF"}
           active={activeView === "chat"}
           onClick={() => onViewChange("chat")}
-          disabled={!selectedDocumentId}
-          tooltip={!selectedDocumentId ? "Upload a PDF first" : undefined}
+          disabled={!selectedDocumentId && selectedDocumentIds.size === 0}
+          tooltip={!selectedDocumentId && selectedDocumentIds.size === 0 ? "Upload a PDF first" : undefined}
         />
       </nav>
 
@@ -142,12 +151,26 @@ export default function Sidebar({
             <ul className="space-y-0.5">
               {filtered.map((item) => (
               <li key={item.id} className="group relative">
+                {/* Checkbox for multi-select */}
+                <button
+                  onClick={(e) => { e.stopPropagation(); onToggleSelect(item.id); }}
+                  title={selectedDocumentIds.has(item.id) ? "Deselect" : "Select for multi-doc chat"}
+                  className="absolute left-1 top-1/2 -translate-y-1/2 z-10 flex h-6 w-6 items-center justify-center text-gray-600 opacity-0 group-hover:opacity-100 transition-opacity duration-150"
+                  style={{ opacity: selectedDocumentIds.has(item.id) ? 1 : undefined }}
+                >
+                  {selectedDocumentIds.has(item.id)
+                    ? <CheckSquare className="h-3.5 w-3.5 text-violet-400" />
+                    : <Square className="h-3.5 w-3.5" />}
+                </button>
+
                 <button
                   onClick={() => onSelectHistory(item.id)}
                   className={cn(
-                    "w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2 pr-8 text-left transition-all duration-150",
+                    "w-full flex items-center gap-2.5 rounded-lg pl-7 pr-8 py-2 text-left transition-all duration-150",
                     selectedDocumentId === item.id
                       ? "bg-violet-600/15 text-violet-300"
+                      : selectedDocumentIds.has(item.id)
+                      ? "bg-violet-900/10 text-gray-300"
                       : "text-gray-400 hover:bg-gray-800/50 hover:text-gray-200"
                   )}
                 >
@@ -161,7 +184,7 @@ export default function Sidebar({
                   )}
                 </button>
 
-                {/* Delete button — visible on hover or while deleting */}
+                {/* Delete button */}
                 <button
                   onClick={(e) => handleDelete(e, item.id)}
                   disabled={deletingId === item.id}
@@ -190,6 +213,19 @@ export default function Sidebar({
           );
         })()}
       </div>
+
+      {/* Multi-doc chat action */}
+      {selectedDocumentIds.size >= 2 && (
+        <div className="px-3 pb-2">
+          <button
+            onClick={onChatWithSelected}
+            className="w-full flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-600 px-3 py-2 text-xs font-semibold text-white shadow-lg shadow-violet-900/30 hover:shadow-violet-900/50 hover:scale-[1.01] transition-all duration-200"
+          >
+            <Layers className="h-3.5 w-3.5" />
+            Chat with {selectedDocumentIds.size} docs
+          </button>
+        </div>
+      )}
 
       {/* Footer — user info + sign out */}
       <div className="border-t border-gray-800/60 p-3 space-y-1">
