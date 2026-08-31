@@ -17,15 +17,17 @@ export interface Message {
 }
 
 interface ChatWindowProps {
+  batchId?: string;
   documentId?: string;
   /** For multi-doc mode: pass 2+ IDs and the chat routes to /api/chat/multi */
   documentIds?: string[];
   filename: string;
+  documentCount?: number;
   /** When provided, chats via the public /api/share/{token}/chat endpoint (no auth). */
   shareToken?: string;
 }
 
-export default function ChatWindow({ documentId, documentIds, filename, shareToken }: ChatWindowProps) {
+export default function ChatWindow({ batchId, documentId, documentIds, filename, documentCount, shareToken }: ChatWindowProps) {
   // Effective doc IDs: prefer explicit documentIds array, fall back to single documentId
   const effectiveDocIds: string[] =
     documentIds && documentIds.length > 0
@@ -33,13 +35,14 @@ export default function ChatWindow({ documentId, documentIds, filename, shareTok
       : documentId
       ? [documentId]
       : [];
-  const isMultiDoc = effectiveDocIds.length > 1;
+  const isMultiDoc = !!(batchId && documentCount && documentCount > 1) || effectiveDocIds.length > 1;
+  const count = documentCount || effectiveDocIds.length || 1;
 
   const welcomeMessage: Message = {
     id: "welcome",
     role: "assistant",
     content: isMultiDoc
-      ? `Hello! I've analyzed **${effectiveDocIds.length} documents**. Ask me anything — I'll search across all of them to find the best answer.`
+      ? `Hello! I've analyzed **${count} documents** in **${filename}**. Ask me anything — I'll search across all documents in this batch to find the best answer.`
       : `Hello! I've analyzed **${filename}**. Ask me anything about this document — I'll provide answers based on its content.`,
     timestamp: new Date(),
   };
@@ -142,15 +145,22 @@ export default function ChatWindow({ documentId, documentIds, filename, shareTok
         // Public share-link chat — no auth needed
         endpoint = `${FASTAPI_URL}/api/share/${shareToken}/chat`;
         payload = { question: trimmed, chat_history: history };
-      } else if (isMultiDoc) {
-        // Multi-document RAG chat
+      } else if (batchId) {
+        // Batch-scoped RAG chat
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token ?? "";
+        endpoint = `${FASTAPI_URL}/api/chat`;
+        headers["Authorization"] = `Bearer ${token}`;
+        payload = { batch_id: batchId, question: trimmed, chat_history: history };
+      } else if (effectiveDocIds.length > 1) {
+        // Multi-document explicit RAG chat
         const { data: { session } } = await supabase.auth.getSession();
         const token = session?.access_token ?? "";
         endpoint = `${FASTAPI_URL}/api/chat/multi`;
         headers["Authorization"] = `Bearer ${token}`;
         payload = { document_ids: effectiveDocIds, question: trimmed, chat_history: history };
       } else {
-        // Authenticated owner/dashboard chat
+        // Authenticated owner/dashboard single document chat
         const { data: { session } } = await supabase.auth.getSession();
         const token = session?.access_token ?? "";
         endpoint = `${FASTAPI_URL}/api/chat`;
@@ -159,7 +169,7 @@ export default function ChatWindow({ documentId, documentIds, filename, shareTok
       }
 
       const response = await axios.post(endpoint, payload, {
-        timeout: 180000, // 3 minutes — CPU-only Ollama can be slow on first load
+        timeout: 180000,
         headers,
       });
 

@@ -68,6 +68,112 @@ def _get_client() -> Client:
     return _supabase_client
 
 
+# ── Upload Batches ────────────────────────────────────────────────────────────
+
+def create_batch(user_id: str, title: str) -> dict[str, Any]:
+    """
+    Insert a new row into the `upload_batches` table and return the saved record.
+
+    Args:
+        user_id: The authenticated user's UUID (from Supabase Auth).
+        title:   Display title for the batch (e.g., filename or summary of files).
+
+    Returns:
+        The inserted row dict (includes `id` and `created_at`).
+    """
+    payload = {
+        "user_id": user_id,
+        "title": title,
+    }
+    response = _get_service_client().table("upload_batches").insert(payload).execute()
+    if not response.data:
+        raise RuntimeError(
+            f"Failed to create upload batch. Supabase response: {response}"
+        )
+    return response.data[0]
+
+
+def get_batches_by_user(user_id: str) -> list[dict[str, Any]]:
+    """
+    Fetch all upload batches belonging to the given user along with nested documents.
+    Ordered newest-first.
+    """
+    response = (
+        _get_service_client()
+        .table("upload_batches")
+        .select("id, title, created_at, documents(id, file_name, file_url, created_at, summary, word_count)")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data or []
+
+
+def get_batch_by_id(batch_id: str, user_id: str | None = None) -> dict[str, Any] | None:
+    """
+    Fetch a single upload batch by UUID along with its documents.
+    """
+    query = (
+        _get_service_client()
+        .table("upload_batches")
+        .select("id, title, created_at, documents(id, file_name, file_url, created_at, summary, word_count)")
+        .eq("id", batch_id)
+    )
+    if user_id:
+        query = query.eq("user_id", user_id)
+
+    response = query.maybe_single().execute()
+    return response.data
+
+
+def delete_batch(batch_id: str, user_id: str) -> bool:
+    """
+    Delete a batch and all its associated documents, chunks, shares, and comments.
+    """
+    client = _get_service_client()
+
+    # 1. Verify ownership
+    owned = (
+        client.table("upload_batches")
+        .select("id")
+        .eq("id", batch_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not owned.data:
+        return False
+
+    # 2. Find all child documents to clean up any dependent shares/comments
+    docs = (
+        client.table("documents")
+        .select("id")
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    doc_ids = [d["id"] for d in (docs.data or [])]
+
+    if doc_ids:
+        for doc_id in doc_ids:
+            client.table("document_shares").delete().eq("document_id", doc_id).execute()
+            client.table("document_comments").delete().eq("document_id", doc_id).execute()
+        client.table("document_chunks").delete().in_("document_id", doc_ids).execute()
+        client.table("documents").delete().in_("id", doc_ids).execute()
+
+    # Also clean chunks tagged directly with batch_id if any remain
+    client.table("document_chunks").delete().eq("batch_id", batch_id).execute()
+
+    # 3. Delete the batch row
+    response = (
+        client.table("upload_batches")
+        .delete()
+        .eq("id", batch_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return bool(response.data)
+
+
 # ── Document Metadata ─────────────────────────────────────────────────────────
 
 def save_document_metadata(
@@ -76,6 +182,7 @@ def save_document_metadata(
     file_url: str,
     summary: str | None = None,
     word_count: int | None = None,
+    batch_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Insert a new row into the `documents` table and return the saved record.
@@ -84,13 +191,9 @@ def save_document_metadata(
         user_id:    The authenticated user's UUID (from Supabase Auth).
         file_name:  Original filename of the uploaded PDF.
         file_url:   Public or signed URL of the file stored in Supabase Storage.
-        summary:    The Groq-generated AI summary text, if already computed
-                    at upload time. Persisted so it survives page reloads —
-                    previously this was only returned in the upload response
-                    and never written to the DB, which is why summaries
-                    disappeared after the initial request.
-        word_count: Optional word count of the summary, so the frontend
-                    doesn't need to recompute it on every render.
+        summary:    The Groq-generated AI summary text.
+        word_count: Optional word count of the summary.
+        batch_id:   Optional UUID of the parent upload batch.
 
     Returns:
         The inserted row as a dict (includes auto-generated `id` and
@@ -99,21 +202,18 @@ def save_document_metadata(
     Raises:
         RuntimeError: If the Supabase insert fails.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "user_id": user_id,
         "file_name": file_name,
         "file_url": file_url,
     }
+    if batch_id is not None:
+        payload["batch_id"] = batch_id
     if summary is not None:
         payload["summary"] = summary
     if word_count is not None:
         payload["word_count"] = word_count
 
-    # Use the service-role client so the insert succeeds regardless of the
-    # documents RLS INSERT policy (which checks auth.uid(), a value that is
-    # always NULL when the request originates from this server-side Python
-    # client rather than from a browser session).  Ownership is enforced
-    # here by including user_id in the payload, not by relying on RLS alone.
     response = _get_service_client().table("documents").insert(payload).execute()
 
     if not response.data:
@@ -180,6 +280,7 @@ def store_document_chunks(
     chunks: list[str],
     embeddings: list[list[float]],
     metadatas: list[dict] | None = None,
+    batch_id: str | None = None,
 ) -> None:
     """
     Bulk-insert text chunks and their embedding vectors into `document_chunks`.
@@ -188,13 +289,8 @@ def store_document_chunks(
         document_id: UUID of the parent document row.
         chunks:      List of text strings (one per chunk).
         embeddings:  Parallel list of embedding vectors (same length as chunks).
-        metadatas:   Optional parallel list of metadata dicts (section_index,
-                     split_method, source filename etc.) to persist in the
-                     `metadata` JSONB column. Defaults to empty dicts if not
-                     provided. Previously this parameter was not accepted here
-                     even though main.py was passing it, causing a TypeError
-                     on every upload → chunks were silently never stored →
-                     retrieval always returned empty results.
+        metadatas:   Optional parallel list of metadata dicts.
+        batch_id:    Optional UUID of the parent upload batch.
 
     Raises:
         ValueError:   If chunks and embeddings lengths do not match.
@@ -215,14 +311,11 @@ def store_document_chunks(
             "content": chunk,
             "embedding": embedding,
             "metadata": meta,
+            **({"batch_id": batch_id} if batch_id is not None else {}),
         }
         for chunk, embedding, meta in zip(chunks, embeddings, _metadatas)
     ]
 
-    # Use the service-role client for the same reason as save_document_metadata:
-    # the RLS INSERT policy on document_chunks checks auth.uid(), which is
-    # always NULL for server-side Python requests → inserts would silently
-    # fail or raise 403 without the service key.
     response = _get_service_client().table("document_chunks").insert(rows).execute()
 
     if not response.data:
@@ -241,43 +334,6 @@ def search_similar_chunks(
 ) -> list[str]:
     """
     Retrieve the top-K most semantically similar chunks for a given query.
-
-    Calls the `match_document_chunks` Postgres function (defined via RPC),
-    which uses pgvector's `<=>` cosine distance operator under the hood.
-
-    IMPORTANT: The parameter names in the RPC payload below MUST match EXACTLY
-    what the deployed SQL function declares — PostgREST resolves RPC calls via
-    strict named-parameter matching against its schema cache, not fuzzy or
-    positional matching. The live deployed function (supabase_schema.sql)
-    declares the document filter parameter as `filter_document_id`.
-
-    Args:
-        document_id:     UUID of the document to search within.
-        query_embedding: 768-dimensional embedding of the user's question.
-        match_count:     How many top chunks to return (default: 5).
-        match_threshold: Minimum cosine similarity (0-1) for a chunk to be
-                          considered a match (default: 0.5). Raise this for
-                          stricter relevance, lower it if legitimate chunks
-                          are being filtered out. Applied here in Python,
-                          since the underlying SQL function does not accept
-                          a threshold parameter.
-
-    Returns:
-        A list of content strings for the top matching chunks, ordered by
-        descending similarity.
-
-    Raises:
-        RuntimeError: If the RPC call fails (response.data is None).
-
-    NOTE — parameter name history:
-      The SQL function's document-filter parameter is `filter_document_id`
-      (as declared in supabase_schema.sql). A previous edit incorrectly
-      changed this to `match_document_id` in the Python RPC payload, causing
-      PostgREST to fail to resolve the function (unrecognised parameter name),
-      returning None for response.data and raising a RuntimeError → 500.
-      Reverted to `filter_document_id` to match the live deployed signature.
-      The `match_threshold` parameter never existed in the SQL function; it is
-      applied as a Python-side filter on the returned `similarity` column.
     """
     response = _get_service_client().rpc(
         "match_document_chunks",
@@ -293,8 +349,6 @@ def search_similar_chunks(
             f"Vector search RPC failed. Supabase response: {response}"
         )
 
-    # Apply the similarity threshold here, since the SQL function returns
-    # all top `match_count` rows regardless of similarity score.
     filtered_rows = [
         row for row in response.data
         if row.get("similarity", 0) >= match_threshold
@@ -311,24 +365,6 @@ def search_similar_chunks_multi(
 ) -> list[str]:
     """
     Retrieve the top-K most semantically similar chunks across MULTIPLE documents.
-
-    Calls the `match_document_chunks_multi` Postgres RPC which uses
-    `WHERE document_id = ANY(filter_document_ids)` to search all provided
-    documents in a single query, ordered by cosine similarity globally.
-
-    Args:
-        document_ids:    List of document UUIDs to search across.
-        query_embedding: 768-dimensional embedding of the user's question.
-        match_count:     How many top chunks to return globally (default: 8).
-        match_threshold: Minimum cosine similarity (0-1) to include a chunk.
-
-    Returns:
-        A list of content strings for the top matching chunks, ordered by
-        descending similarity, sourced from any of the provided documents.
-
-    Raises:
-        ValueError:   If document_ids is empty.
-        RuntimeError: If the RPC call fails.
     """
     if not document_ids:
         raise ValueError("document_ids must contain at least one ID.")
@@ -353,6 +389,68 @@ def search_similar_chunks_multi(
     ]
 
     return [row["content"] for row in filtered_rows]
+
+
+def search_similar_chunks_by_batch(
+    batch_id: str,
+    query_embedding: list[float],
+    match_count: int = 8,
+    match_threshold: float = 0.0,
+) -> list[str]:
+    """
+    Retrieve the top-K most semantically similar chunks across an ENTIRE upload batch.
+
+    Calls the `match_batch_chunks` Postgres RPC function which filters on
+    `WHERE batch_id = filter_batch_id`. If `match_batch_chunks` is not yet
+    deployed or fails, it falls back to resolving document IDs in the batch
+    and invoking `match_document_chunks_multi`.
+
+    Args:
+        batch_id:        UUID of the upload batch.
+        query_embedding: 768-dimensional embedding of the question.
+        match_count:     Top chunks to return.
+        match_threshold: Minimum cosine similarity.
+
+    Returns:
+        List of content strings for top matching chunks.
+    """
+    client = _get_service_client()
+    try:
+        response = client.rpc(
+            "match_batch_chunks",
+            {
+                "query_embedding": query_embedding,
+                "filter_batch_id": batch_id,
+                "match_count": match_count,
+            },
+        ).execute()
+
+        if response.data is not None:
+            filtered_rows = [
+                row for row in response.data
+                if row.get("similarity", 0) >= match_threshold
+            ]
+            return [row["content"] for row in filtered_rows]
+    except Exception as exc:
+        print(f"[search_similar_chunks_by_batch] Direct batch RPC failed ({exc}), falling back to multi-doc search.")
+
+    # Fallback: lookup document IDs in batch and search multi
+    docs_resp = (
+        client.table("documents")
+        .select("id")
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    doc_ids = [d["id"] for d in (docs_resp.data or [])]
+    if not doc_ids:
+        return []
+
+    return search_similar_chunks_multi(
+        document_ids=doc_ids,
+        query_embedding=query_embedding,
+        match_count=match_count,
+        match_threshold=match_threshold,
+    )
 
 
 

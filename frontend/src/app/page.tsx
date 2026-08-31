@@ -2,9 +2,19 @@
 
 import { useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { FileText, Sparkles, MessageSquare, UploadCloud, ArrowRight, Loader2 } from "lucide-react";
-import Sidebar from "@/components/Sidebar";
-import PdfUploader from "@/components/PdfUploader";
+import {
+  FileText,
+  Sparkles,
+  MessageSquare,
+  UploadCloud,
+  ArrowRight,
+  Loader2,
+  Layers,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
+import Sidebar, { BatchHistoryItem } from "@/components/Sidebar";
+import PdfUploader, { BatchSuccessData } from "@/components/PdfUploader";
 import SummaryView from "@/components/SummaryView";
 import ChatWindow from "@/components/ChatWindow";
 import CommentSection from "@/components/CommentSection";
@@ -15,11 +25,19 @@ import { supabase } from "@/lib/supabaseClient";
 
 const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
-interface UploadedDocument {
+export interface BatchDocument {
   id: string;
   filename: string;
   summary: string;
+  word_count?: number | null;
   uploadedAt: string;
+}
+
+export interface UploadBatch {
+  id: string;
+  title: string;
+  uploadedAt: string;
+  documents: BatchDocument[];
 }
 
 type ActiveView = "upload" | "chat";
@@ -28,107 +46,122 @@ export default function DashboardPage() {
   const router = useRouter();
   const { user, loading } = useAuth();
   const [activeView, setActiveView] = useState<ActiveView>("upload");
-  const [documents, setDocuments] = useState<UploadedDocument[]>([]);
-  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
-  // Multi-select: set of doc IDs checked for cross-document chat
-  const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
+  const [batches, setBatches] = useState<UploadBatch[]>([]);
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
   const [authToken, setAuthToken] = useState<string | null>(null);
-  const [isFetchingDocs, setIsFetchingDocs] = useState(false);
+  const [isFetchingBatches, setIsFetchingBatches] = useState(false);
 
   /**
-   * Fetch the user's document history from the backend.
-   * Called on mount (to restore sidebar after refresh) and after each upload.
-   * Uses the JWT so the backend can scope results to this user only.
+   * Fetch user's upload batch history from the backend.
    */
-  const fetchDocuments = useCallback(async (token: string) => {
-    setIsFetchingDocs(true);
+  const fetchBatches = useCallback(async (token: string) => {
+    setIsFetchingBatches(true);
     try {
-      const res = await fetch(`${FASTAPI_URL}/api/documents`, {
+      const res = await fetch(`${FASTAPI_URL}/api/batches`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) return;
-      const data: Array<{ id: string; file_name: string; created_at: string; summary?: string | null }> = await res.json();
-      setDocuments((prev) => {
-        // Build a lookup of existing summaries so a just-uploaded doc's
-        // freshly-generated summary is not lost if the DB hasn't persisted
-        // yet when this refetch fires.
-        const existingSummaries: Record<string, string> = {};
-        prev.forEach((d) => { if (d.summary) existingSummaries[d.id] = d.summary; });
 
-        return data.map((d) => ({
-          id: d.id,
-          filename: d.file_name,
-          // ISO timestamp → readable time (e.g. "14:32")
-          uploadedAt: new Date(d.created_at).toLocaleTimeString([], {
+      const data: Array<{
+        id: string;
+        title: string;
+        created_at: string;
+        documents: Array<{
+          id: string;
+          file_name: string;
+          created_at: string;
+          summary?: string | null;
+          word_count?: number | null;
+        }>;
+      }> = await res.json();
+
+      setBatches((prev) => {
+        // Retain any in-memory summaries if freshly uploaded
+        const summaryLookup: Record<string, string> = {};
+        prev.forEach((b) => {
+          b.documents.forEach((d) => {
+            if (d.summary) summaryLookup[d.id] = d.summary;
+          });
+        });
+
+        return data.map((b) => ({
+          id: b.id,
+          title: b.title,
+          uploadedAt: new Date(b.created_at).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
           }),
-          // Prefer: DB summary → existing in-memory summary → empty string
-          summary: d.summary ?? existingSummaries[d.id] ?? "",
+          documents: (b.documents || []).map((d) => ({
+            id: d.id,
+            filename: d.file_name,
+            uploadedAt: new Date(d.created_at).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            summary: d.summary ?? summaryLookup[d.id] ?? "",
+            word_count: d.word_count,
+          })),
         }));
       });
     } catch {
-      // Non-fatal: sidebar will just be empty until next upload
+      // Non-fatal fallback
     } finally {
-      setIsFetchingDocs(false);
+      setIsFetchingBatches(false);
     }
   }, []);
 
-  // Keep the access token fresh for Share/Comment calls
+  // Keep access token updated
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       const token = session?.access_token ?? null;
       setAuthToken(token);
-      // Restore sidebar history from the API now that we have a token
-      if (token) fetchDocuments(token);
+      if (token) fetchBatches(token);
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, session) => setAuthToken(session?.access_token ?? null)
     );
     return () => subscription.unsubscribe();
-  }, [fetchDocuments]);
+  }, [fetchBatches]);
 
-  // Redirect to /auth if not authenticated
+  // Auth redirect
   useEffect(() => {
     if (!loading && !user) {
       router.replace("/auth");
     }
   }, [loading, user, router]);
 
-  // ── All hooks MUST be declared unconditionally, before any early return ──
-  // (moved up from below the loading/user guard to fix "change in order of Hooks")
   const handleUploadSuccess = useCallback(
-    (data: { document_id: string; summary: string; filename: string }) => {
-      const now = new Date();
-      const formatted = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    (data: BatchSuccessData) => {
+      const formatted = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-      const newDoc: UploadedDocument = {
-        id: data.document_id,
-        filename: data.filename,
-        summary: data.summary,
+      const newBatch: UploadBatch = {
+        id: data.batch_id,
+        title: data.title,
         uploadedAt: formatted,
+        documents: data.documents.map((d) => ({
+          id: d.document_id,
+          filename: d.file_name,
+          summary: d.summary,
+          word_count: d.word_count,
+          uploadedAt: formatted,
+        })),
       };
 
-      // Prepend the new upload and deduplicate (id is the key)
-      setDocuments((prev) => {
-        const without = prev.filter((d) => d.id !== newDoc.id);
-        return [newDoc, ...without];
-      });
-      setSelectedDocId(newDoc.id);
+      setBatches((prev) => [newBatch, ...prev.filter((b) => b.id !== newBatch.id)]);
+      setSelectedBatchId(newBatch.id);
       setShowSummary(true);
 
-      // Refresh the full list so the sidebar stays consistent with the DB
-      if (authToken) fetchDocuments(authToken);
+      if (authToken) fetchBatches(authToken);
     },
-    [authToken, fetchDocuments]
+    [authToken, fetchBatches]
   );
 
-  const handleDeleteDocument = useCallback(
-    async (id: string) => {
+  const handleDeleteBatch = useCallback(
+    async (batchId: string) => {
       if (!authToken) return;
       try {
-        const res = await fetch(`${FASTAPI_URL}/api/documents/${id}`, {
+        const res = await fetch(`${FASTAPI_URL}/api/batches/${batchId}`, {
           method: "DELETE",
           headers: { Authorization: `Bearer ${authToken}` },
         });
@@ -136,29 +169,13 @@ export default function DashboardPage() {
       } catch {
         return;
       }
-      setDocuments((prev) => prev.filter((d) => d.id !== id));
-      setSelectedDocId((prev) => (prev === id ? null : prev));
-      setSelectedDocIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
-      setShowSummary((prev) => (selectedDocId === id ? false : prev));
+      setBatches((prev) => prev.filter((b) => b.id !== batchId));
+      setSelectedBatchId((prev) => (prev === batchId ? null : prev));
+      setShowSummary((prev) => (selectedBatchId === batchId ? false : prev));
     },
-    [authToken, selectedDocId]
+    [authToken, selectedBatchId]
   );
 
-  const handleToggleSelect = useCallback((id: string) => {
-    setSelectedDocIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }, []);
-
-  const handleChatWithSelected = useCallback(() => {
-    setActiveView("chat");
-  }, []);
-
-  // Show full-screen spinner while session is being resolved.
-  // This early return now happens AFTER all hooks are called, so hook
-  // order/count stays identical across the loading -> authenticated transition.
   if (loading || !user) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-950">
@@ -167,17 +184,25 @@ export default function DashboardPage() {
     );
   }
 
-  // Get the currently selected document
-  const selectedDocument = documents.find((d) => d.id === selectedDocId) ?? null;
-  // Documents selected for multi-doc chat
-  const selectedDocumentsForChat = documents.filter((d) => selectedDocIds.has(d.id));
-  // True if multi-doc chat mode is active
-  const isMultiDocMode = selectedDocIds.size >= 2;
+  const selectedBatch = batches.find((b) => b.id === selectedBatchId) ?? null;
+  const primaryDocId = selectedBatch?.documents[0]?.id ?? null;
 
-  const handleSelectHistory = (id: string) => {
-    setSelectedDocId(id);
+  const handleSelectHistory = (batchId: string) => {
+    setSelectedBatchId(batchId);
     setShowSummary(true);
   };
+
+  const uploadHistoryItems: BatchHistoryItem[] = batches.map((b) => ({
+    id: b.id,
+    title: b.title,
+    uploadedAt: b.uploadedAt,
+    documents: b.documents.map((d) => ({
+      id: d.id,
+      filename: d.filename,
+      summary: d.summary,
+      word_count: d.word_count,
+    })),
+  }));
 
   return (
     <div className="flex h-screen overflow-hidden bg-gray-950">
@@ -185,19 +210,12 @@ export default function DashboardPage() {
       <Sidebar
         activeView={activeView}
         onViewChange={setActiveView}
-        uploadHistory={documents.map((d) => ({
-          id: d.id,
-          filename: d.filename,
-          uploadedAt: d.uploadedAt,
-        }))}
+        uploadHistory={uploadHistoryItems}
         onSelectHistory={handleSelectHistory}
-        onDeleteDocument={handleDeleteDocument}
-        selectedDocumentId={selectedDocId}
-        selectedDocumentIds={selectedDocIds}
-        onToggleSelect={handleToggleSelect}
-        onChatWithSelected={handleChatWithSelected}
+        onDeleteBatch={handleDeleteBatch}
+        selectedBatchId={selectedBatchId}
         userEmail={user.email ?? ""}
-        isLoadingHistory={isFetchingDocs}
+        isLoadingHistory={isFetchingBatches}
       />
 
       {/* Main Content */}
@@ -211,20 +229,20 @@ export default function DashboardPage() {
             <p className="text-xs text-gray-500 truncate">
               {activeView === "upload"
                 ? "Upload PDFs to extract insights and AI summaries"
-                : isMultiDocMode
-                ? `Chatting across ${selectedDocIds.size} documents`
-                : selectedDocument
-                ? `Chatting with: ${selectedDocument.filename}`
-                : "Select a document to begin chatting"}
+                : selectedBatch && selectedBatch.documents.length > 1
+                ? `Chatting across batch (${selectedBatch.documents.length} PDFs): ${selectedBatch.title}`
+                : selectedBatch
+                ? `Chatting with: ${selectedBatch.title}`
+                : "Select an upload to begin chatting"}
             </p>
           </div>
 
-          {/* Share controls — visible whenever a document is selected */}
-          {selectedDocId && authToken && (
+          {/* Share controls for primary document */}
+          {primaryDocId && authToken && (
             <div className="flex-shrink-0">
               <ShareControls
-                key={selectedDocId}
-                documentId={selectedDocId}
+                key={primaryDocId}
+                documentId={primaryDocId}
                 authToken={authToken}
               />
             </div>
@@ -244,7 +262,7 @@ export default function DashboardPage() {
               label="Chat"
               active={activeView === "chat"}
               onClick={() => setActiveView("chat")}
-              disabled={!selectedDocId}
+              disabled={!selectedBatchId}
               id="tab-chat"
             />
           </div>
@@ -255,41 +273,35 @@ export default function DashboardPage() {
           {activeView === "upload" && (
             <UploadView
               onSuccess={handleUploadSuccess}
-              selectedDocument={selectedDocument}
-              selectedDocuments={isMultiDocMode ? selectedDocumentsForChat : selectedDocument ? [selectedDocument] : []}
+              selectedBatch={selectedBatch}
               showSummary={showSummary}
               onGoToChat={() => setActiveView("chat")}
               userId={user.id}
               authToken={authToken}
               ownerName={user.email ?? "You"}
-              isMultiDocMode={isMultiDocMode}
             />
           )}
 
-          {activeView === "chat" && (isMultiDocMode || selectedDocument) ? (
+          {activeView === "chat" && selectedBatch ? (
             <div className="h-full" style={{ height: "calc(100vh - 130px)" }}>
               <ChatWindow
-                documentId={!isMultiDocMode ? selectedDocument?.id : undefined}
-                documentIds={isMultiDocMode ? Array.from(selectedDocIds) : undefined}
-                filename={
-                  isMultiDocMode
-                    ? `${selectedDocIds.size} documents`
-                    : (selectedDocument?.filename ?? "")
-                }
+                batchId={selectedBatch.id}
+                documentCount={selectedBatch.documents.length}
+                filename={selectedBatch.title}
               />
             </div>
-          ) : activeView === "chat" && !selectedDocument && !isMultiDocMode ? (
+          ) : activeView === "chat" && !selectedBatch ? (
             <EmptyState
               icon={<MessageSquare className="h-12 w-12 text-gray-700" />}
-              title="No Document Selected"
-              description="Upload a PDF first, then come back here to start chatting."
+              title="No Upload Selected"
+              description="Upload PDFs first or choose one from the sidebar to begin chatting."
               action={
                 <button
                   onClick={() => setActiveView("upload")}
                   className="flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-violet-500 transition-colors"
                 >
                   <UploadCloud className="h-4 w-4" />
-                  Upload a PDF
+                  Upload PDFs
                 </button>
               }
             />
@@ -303,25 +315,42 @@ export default function DashboardPage() {
 /* ─── Sub-components ─────────────────────────────────────────────── */
 
 interface UploadViewProps {
-  onSuccess: (data: { document_id: string; summary: string; filename: string }) => void;
-  selectedDocument: UploadedDocument | null;
-  /** All documents to show summaries for (1 in single mode, N in multi mode) */
-  selectedDocuments: UploadedDocument[];
+  onSuccess: (data: BatchSuccessData) => void;
+  selectedBatch: UploadBatch | null;
   showSummary: boolean;
   onGoToChat: () => void;
   userId: string;
   authToken: string | null;
   ownerName: string;
-  isMultiDocMode: boolean;
 }
 
-function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummary, onGoToChat, userId, authToken, ownerName, isMultiDocMode }: UploadViewProps) {
+function UploadView({
+  onSuccess,
+  selectedBatch,
+  showSummary,
+  onGoToChat,
+  userId,
+  authToken,
+  ownerName,
+}: UploadViewProps) {
+  const [activeTabDocId, setActiveTabDocId] = useState<string | null>(null);
+
+  // Sync active tab when batch changes
+  useEffect(() => {
+    if (selectedBatch && selectedBatch.documents.length > 0) {
+      setActiveTabDocId(selectedBatch.documents[0].id);
+    } else {
+      setActiveTabDocId(null);
+    }
+  }, [selectedBatch]);
+
+  const isMultiFile = (selectedBatch?.documents.length ?? 0) > 1;
+
   return (
     <div className="mx-auto max-w-3xl space-y-6">
-      {/* Welcome banner — only shown when no document uploaded */}
-      {!selectedDocument && !isMultiDocMode && (
+      {/* Welcome banner */}
+      {!selectedBatch && (
         <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-violet-950/60 via-gray-900 to-indigo-950/60 border border-violet-800/30 p-8">
-          {/* Background glow */}
           <div className="absolute -top-10 -right-10 h-40 w-40 rounded-full bg-violet-600/10 blur-3xl" />
           <div className="absolute -bottom-10 -left-5 h-32 w-32 rounded-full bg-indigo-600/10 blur-3xl" />
 
@@ -331,18 +360,18 @@ function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummar
             </div>
             <div>
               <h2 className="text-xl font-semibold text-white">
-                Chat with any PDF — instantly
+                Chat with any PDF — or multi-PDF batch
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-gray-400">
-                Upload a document and ask questions in plain English. Get accurate answers,
-                key highlights, and a full summary — no technical knowledge needed.
+                Upload one or multiple documents in a single action. Each PDF gets its own distinct AI summary,
+                and the chatbot searches across the entire batch seamlessly.
               </p>
               <div className="mt-4 flex flex-wrap gap-3">
                 {[
-                  { icon: "📄", label: "Instant summary" },
-                  { icon: "💬", label: "Ask anything" },
-                  { icon: "🔍", label: "Find key info fast" },
-                  { icon: "📚", label: "Multiple documents" },
+                  { icon: "📦", label: "Unified batch sessions" },
+                  { icon: "📄", label: "Per-file summaries" },
+                  { icon: "💬", label: "Cross-document RAG" },
+                  { icon: "⚡", label: "Groq + Gemini powered" },
                 ].map(({ icon, label }) => (
                   <span
                     key={label}
@@ -361,21 +390,67 @@ function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummar
       {/* Uploader */}
       <PdfUploader onSuccess={onSuccess} userId={userId} />
 
-      {/* Multi-doc stacked summaries */}
-      {isMultiDocMode && selectedDocuments.length > 0 && (
-        <div className="space-y-3 animate-in fade-in slide-in-from-bottom-4 duration-500">
-          <div className="flex items-center gap-2 px-1">
-            <Sparkles className="h-4 w-4 text-violet-400" />
-            <p className="text-sm font-semibold text-white">
-              {selectedDocuments.length} Documents Selected
-            </p>
-            <span className="text-xs text-gray-500">— summaries shown below</span>
+      {/* Multi-file batch summaries view */}
+      {showSummary && selectedBatch && isMultiFile && (
+        <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="flex items-center justify-between px-1">
+            <div className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-violet-400" />
+              <p className="text-sm font-semibold text-white">
+                Batch: {selectedBatch.title}
+              </p>
+              <span className="rounded-full bg-violet-900/50 px-2 py-0.5 text-xs text-violet-300">
+                {selectedBatch.documents.length} files
+              </span>
+            </div>
           </div>
 
-          {selectedDocuments.map((doc) => (
-            <SummaryView key={doc.id} summary={doc.summary} filename={doc.filename} />
-          ))}
+          {/* File selector tabs within the batch */}
+          <div className="flex flex-wrap gap-1.5 p-1 rounded-xl bg-gray-900/90 border border-gray-800">
+            {selectedBatch.documents.map((doc, idx) => {
+              const isTabActive = (activeTabDocId || selectedBatch.documents[0].id) === doc.id;
+              return (
+                <button
+                  key={doc.id}
+                  onClick={() => setActiveTabDocId(doc.id)}
+                  className={cn(
+                    "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-150 max-w-[220px]",
+                    isTabActive
+                      ? "bg-violet-600 text-white shadow-md shadow-violet-900/30"
+                      : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/60"
+                  )}
+                >
+                  <FileText className="h-3.5 w-3.5 flex-shrink-0" />
+                  <span className="truncate">{doc.filename}</span>
+                </button>
+              );
+            })}
+          </div>
 
+          {/* Render active document summary */}
+          {(() => {
+            const currentDoc =
+              selectedBatch.documents.find((d) => d.id === activeTabDocId) ||
+              selectedBatch.documents[0];
+            if (!currentDoc) return null;
+            return (
+              <div key={currentDoc.id} className="space-y-4">
+                <SummaryView
+                  summary={currentDoc.summary}
+                  filename={currentDoc.filename}
+                />
+                <CommentSection
+                  mode="owner"
+                  documentId={currentDoc.id}
+                  authToken={authToken ?? undefined}
+                  currentUserName={ownerName}
+                  defaultCollapsed
+                />
+              </div>
+            );
+          })()}
+
+          {/* CTA to chat across the batch */}
           <div className="flex justify-center pt-2">
             <button
               onClick={onGoToChat}
@@ -383,31 +458,29 @@ function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummar
               className="group flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/30 hover:shadow-violet-900/50 hover:scale-[1.02] transition-all duration-200"
             >
               <Sparkles className="h-4 w-4" />
-              Chat across {selectedDocuments.length} Documents
+              Chat with this Batch ({selectedBatch.documents.length} PDFs)
               <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
             </button>
           </div>
         </div>
       )}
 
-      {/* Single-doc summary — shown after upload */}
-      {!isMultiDocMode && showSummary && selectedDocument && (
+      {/* Single-file batch summary */}
+      {showSummary && selectedBatch && !isMultiFile && selectedBatch.documents[0] && (
         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <SummaryView
-            summary={selectedDocument.summary}
-            filename={selectedDocument.filename}
+            summary={selectedBatch.documents[0].summary}
+            filename={selectedBatch.documents[0].filename}
           />
 
-          {/* Comments — owner view */}
           <CommentSection
             mode="owner"
-            documentId={selectedDocument.id}
+            documentId={selectedBatch.documents[0].id}
             authToken={authToken ?? undefined}
             currentUserName={ownerName}
             defaultCollapsed
           />
 
-          {/* CTA to chat */}
           <div className="flex justify-center">
             <button
               onClick={onGoToChat}
@@ -424,7 +497,6 @@ function UploadView({ onSuccess, selectedDocument, selectedDocuments, showSummar
     </div>
   );
 }
-
 
 function TabButton({
   icon,

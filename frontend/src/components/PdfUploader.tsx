@@ -10,6 +10,7 @@ import {
   Loader2,
   Sparkles,
   Plus,
+  AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabaseClient";
@@ -24,8 +25,22 @@ interface FileEntry {
   error?: string;
 }
 
+export interface BatchSuccessData {
+  batch_id: string;
+  title: string;
+  created_at: string;
+  documents: Array<{
+    document_id: string;
+    file_name: string;
+    summary: string;
+    chunk_count: number;
+    word_count?: number | null;
+  }>;
+  failed?: Array<{ filename: string; error: string }>;
+}
+
 interface PdfUploaderProps {
-  onSuccess: (data: { document_id: string; summary: string; filename: string }) => void;
+  onSuccess: (data: BatchSuccessData) => void;
   userId: string;
 }
 
@@ -33,72 +48,84 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
   const [queue, setQueue] = useState<FileEntry[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [partialWarnings, setPartialWarnings] = useState<Array<{ filename: string; error: string }>>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // ── Process a snapshot of the queue sequentially ───────────────────────────
-  const processQueue = useCallback(
+  // ── Process all queued files in ONE batch request ──────────────────────────
+  const processBatchQueue = useCallback(
     async (entries: FileEntry[]) => {
       setIsRunning(true);
+      setPartialWarnings([]);
 
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
 
-      for (let i = 0; i < entries.length; i++) {
-        if (entries[i].status !== "idle") continue;
-
+      if (!token) {
         setQueue((prev) =>
-          prev.map((e, idx) => (idx === i ? { ...e, status: "processing" } : e))
+          prev.map((e) => ({ ...e, status: "error", error: "Not signed in. Please refresh." }))
         );
-
-        if (!token) {
-          setQueue((prev) =>
-            prev.map((e, idx) =>
-              idx === i ? { ...e, status: "error", error: "Not signed in. Please refresh." } : e
-            )
-          );
-          continue;
-        }
-
-        const formData = new FormData();
-        formData.append("file", entries[i].file);
-
-        try {
-          const response = await axios.post(
-            `${FASTAPI_URL}/api/process-pdf`,
-            formData,
-            {
-              headers: {
-                "Content-Type": "multipart/form-data",
-                Authorization: `Bearer ${token}`,
-              },
-              timeout: 180000,
-            }
-          );
-
-          setQueue((prev) =>
-            prev.map((e, idx) => (idx === i ? { ...e, status: "success" } : e))
-          );
-
-          onSuccess({
-            document_id: response.data.document_id,
-            summary: response.data.summary,
-            filename: entries[i].file.name,
-          });
-        } catch (err: unknown) {
-          let msg = "Failed to process PDF. Please try again.";
-          if (axios.isAxiosError(err)) {
-            const detail = err.response?.data?.detail;
-            if (typeof detail === "string") msg = detail;
-            else if (err.response?.status === 504) msg = "Server timed out. Try a smaller PDF.";
-            else if (!err.response) msg = "Cannot reach the backend server.";
-          }
-          setQueue((prev) =>
-            prev.map((e, idx) => (idx === i ? { ...e, status: "error", error: msg } : e))
-          );
-        }
+        setIsRunning(false);
+        return;
       }
 
-      setIsRunning(false);
+      // Mark all idle files as processing
+      setQueue((prev) =>
+        prev.map((e) => (e.status === "idle" ? { ...e, status: "processing" } : e))
+      );
+
+      const formData = new FormData();
+      entries.forEach((entry) => {
+        formData.append("files", entry.file);
+      });
+
+      try {
+        const response = await axios.post<BatchSuccessData>(
+          `${FASTAPI_URL}/api/process-batch`,
+          formData,
+          {
+            headers: {
+              "Content-Type": "multipart/form-data",
+              Authorization: `Bearer ${token}`,
+            },
+            timeout: 300000, // 5 minutes for multi-file batches
+          }
+        );
+
+        const resData = response.data;
+        const succeededNames = new Set(resData.documents.map((d) => d.file_name));
+        const failedMap = new Map((resData.failed || []).map((f) => [f.filename, f.error]));
+
+        setQueue((prev) =>
+          prev.map((e) => {
+            if (succeededNames.has(e.file.name)) {
+              return { ...e, status: "success" };
+            }
+            if (failedMap.has(e.file.name)) {
+              return { ...e, status: "error", error: failedMap.get(e.file.name) };
+            }
+            return { ...e, status: "success" };
+          })
+        );
+
+        if (resData.failed && resData.failed.length > 0) {
+          setPartialWarnings(resData.failed);
+        }
+
+        onSuccess(resData);
+      } catch (err: unknown) {
+        let msg = "Failed to process PDF batch. Please try again.";
+        if (axios.isAxiosError(err)) {
+          const detail = err.response?.data?.detail;
+          if (typeof detail === "string") msg = detail;
+          else if (err.response?.status === 504) msg = "Server timed out processing PDFs. Try smaller files.";
+          else if (!err.response) msg = "Cannot reach the backend server.";
+        }
+        setQueue((prev) =>
+          prev.map((e) => ({ ...e, status: "error", error: msg }))
+        );
+      } finally {
+        setIsRunning(false);
+      }
     },
     [onSuccess]
   );
@@ -107,19 +134,18 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
   const addFiles = useCallback(
     (files: FileList | File[]) => {
       const valid = Array.from(files).filter(
-        (f) => f.type === "application/pdf" && f.size <= 50 * 1024 * 1024
-      );
+        (f) => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")
+      ).filter((f) => f.size <= 50 * 1024 * 1024);
+
       if (valid.length === 0) return;
 
       const newEntries: FileEntry[] = valid.map((f) => ({ file: f, status: "idle" }));
 
-      setQueue((prev) => {
-        const combined = [...prev, ...newEntries];
-        setTimeout(() => processQueue(combined), 0);
-        return combined;
-      });
+      setQueue(newEntries);
+      setPartialWarnings([]);
+      setTimeout(() => processBatchQueue(newEntries), 0);
     },
-    [processQueue]
+    [processBatchQueue]
   );
 
   const handleDrop = useCallback(
@@ -141,6 +167,7 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
   const handleReset = () => {
     if (isRunning) return;
     setQueue([]);
+    setPartialWarnings([]);
   };
 
   const allDone =
@@ -186,10 +213,10 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
               <Sparkles className="h-6 w-6 text-violet-400" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-gray-200">Processing files…</p>
-              <p className="mt-1 text-xs text-gray-500">
-                {successCount} of {queue.length} done
+              <p className="text-sm font-semibold text-gray-200">
+                Processing {queue.length} file{queue.length !== 1 ? "s" : ""} in batch…
               </p>
+              <p className="mt-1 text-xs text-gray-500">Extracting, embedding & generating summaries</p>
             </div>
           </div>
         ) : (
@@ -211,18 +238,35 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
             </div>
             <span className="flex items-center gap-1.5 rounded-full border border-gray-700 bg-gray-800/60 px-3 py-1 text-xs font-medium text-gray-400">
               <Plus className="h-3 w-3" />
-              Multiple files supported
+              Uploads group into a unified batch
             </span>
           </div>
         )}
       </div>
+
+      {/* Partial warning banner */}
+      {partialWarnings.length > 0 && (
+        <div className="rounded-xl border border-amber-800/50 bg-amber-950/20 p-3.5 text-xs text-amber-300 flex items-start gap-2.5">
+          <AlertTriangle className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <p className="font-semibold">Some files in this batch could not be processed:</p>
+            <ul className="list-disc pl-4 space-y-0.5 text-amber-400/90">
+              {partialWarnings.map((w, idx) => (
+                <li key={idx}>
+                  <span className="font-medium">{w.filename}:</span> {w.error}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {/* Per-file progress list */}
       {queue.length > 0 && (
         <div className="space-y-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
           <div className="flex items-center justify-between px-1">
             <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-              Upload Queue ({queue.length} file{queue.length !== 1 ? "s" : ""})
+              Upload Batch ({queue.length} file{queue.length !== 1 ? "s" : ""})
             </p>
             {allDone && (
               <button
@@ -266,10 +310,10 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
                   <p className="mt-0.5 text-xs text-red-400 truncate">{entry.error}</p>
                 )}
                 {entry.status === "success" && (
-                  <p className="mt-0.5 text-xs text-emerald-500">Ready — summary generated</p>
+                  <p className="mt-0.5 text-xs text-emerald-500">Ready — summary & embeddings generated</p>
                 )}
                 {entry.status === "processing" && (
-                  <p className="mt-0.5 text-xs text-violet-400">Extracting & embedding…</p>
+                  <p className="mt-0.5 text-xs text-violet-400">Processing in batch…</p>
                 )}
                 {entry.status === "idle" && (
                   <p className="mt-0.5 text-xs text-gray-600">Queued</p>
@@ -288,8 +332,8 @@ export default function PdfUploader({ onSuccess, userId }: PdfUploaderProps) {
               anyError ? "text-amber-400" : "text-emerald-400"
             )}>
               {anyError
-                ? `${successCount} of ${queue.length} processed — some files failed`
-                : `All ${queue.length} document${queue.length !== 1 ? "s" : ""} processed successfully!`}
+                ? `${successCount} of ${queue.length} processed in batch — some files had issues`
+                : `Batch created with all ${queue.length} document${queue.length !== 1 ? "s" : ""}!`}
             </p>
           )}
         </div>

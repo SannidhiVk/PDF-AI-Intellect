@@ -106,6 +106,29 @@ class ProcessPdfResponse(BaseModel):
     chunk_count: int
     summary: str
     message: str
+    batch_id: str | None = None
+
+
+class BatchDocumentItem(BaseModel):
+    document_id: str
+    file_name: str
+    chunk_count: int
+    summary: str
+    word_count: int | None = None
+
+
+class BatchFailedItem(BaseModel):
+    filename: str
+    error: str
+
+
+class ProcessBatchResponse(BaseModel):
+    batch_id: str
+    title: str
+    created_at: str
+    documents: list[BatchDocumentItem]
+    failed: list[BatchFailedItem] = []
+    message: str
 
 
 class SummarizeRequest(BaseModel):
@@ -125,6 +148,14 @@ class DocumentListItem(BaseModel):
     created_at: str
     summary: str | None = None
     word_count: int | None = None
+    batch_id: str | None = None
+
+
+class BatchListItem(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    documents: list[DocumentListItem] = []
 
 
 class ChatHistoryItem(BaseModel):
@@ -133,13 +164,15 @@ class ChatHistoryItem(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    document_id: str
+    document_id: str | None = None
+    batch_id: str | None = None
     question: str
     chat_history: list[ChatHistoryItem] = []
 
 
 class ChatResponse(BaseModel):
-    document_id: str
+    document_id: str | None = None
+    batch_id: str | None = None
     question: str
     answer: str
     sources_used: int
@@ -153,7 +186,60 @@ async def root():
     return {"status": "ok", "message": "PDF AI Assistant API is running."}
 
 
-# ── Endpoint 0: List Documents ───────────────────────────────────────────────
+# ── Endpoint 0: List Batches / Documents ──────────────────────────────────────
+
+@app.get(
+    "/api/batches",
+    response_model=list[BatchListItem],
+    summary="List all upload batches and their documents for the user",
+    tags=["Batches"],
+)
+async def list_batches(user_id: str = Depends(get_current_user)):
+    raw_batches = db_service.get_batches_by_user(user_id)
+    items: list[BatchListItem] = []
+    for b in raw_batches:
+        raw_docs = b.get("documents") or []
+        doc_items = [
+            DocumentListItem(
+                id=str(d["id"]),
+                file_name=d["file_name"],
+                file_url=d.get("file_url") or "",
+                created_at=str(d["created_at"]),
+                summary=d.get("summary"),
+                word_count=d.get("word_count"),
+                batch_id=str(b["id"]),
+            )
+            for d in raw_docs
+        ]
+        items.append(
+            BatchListItem(
+                id=str(b["id"]),
+                title=b["title"],
+                created_at=str(b["created_at"]),
+                documents=doc_items,
+            )
+        )
+    return items
+
+
+@app.delete(
+    "/api/batches/{batch_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete an upload batch (and all nested documents, chunks, comments)",
+    tags=["Batches"],
+)
+async def delete_batch(
+    batch_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    deleted = db_service.delete_batch(batch_id=batch_id, user_id=user_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Batch not found or you do not have permission to delete it.",
+        )
+    return {"message": "Batch deleted successfully.", "batch_id": batch_id}
+
 
 @app.get(
     "/api/documents",
@@ -171,12 +257,11 @@ async def list_documents(user_id: str = Depends(get_current_user)):
             created_at=str(d["created_at"]),
             summary=d.get("summary"),
             word_count=d.get("word_count"),
+            batch_id=str(d.get("batch_id")) if d.get("batch_id") else None,
         )
         for d in docs
     ]
 
-
-# ── Endpoint 0b: Delete Document ─────────────────────────────────────────────
 
 @app.delete(
     "/api/documents/{document_id}",
@@ -197,21 +282,140 @@ async def delete_document(
     return {"message": "Document deleted successfully.", "document_id": document_id}
 
 
-# ── Endpoint 1: Process PDF ───────────────────────────────────────────────────
+# ── Helper for processing a single PDF in a batch ─────────────────────────────
+
+async def _process_pdf_file_contents(
+    file_bytes: bytes,
+    filename: str,
+    user_id: str,
+    batch_id: str | None = None,
+) -> tuple[dict, int, str]:
+    """
+    Extracts text, chunks, embeds with Gemini, summarizes with Groq, and stores DB rows.
+    Returns (doc_record, chunk_count, summary).
+    """
+    raw_text = pdf_service.extract_text_from_pdf(file_bytes)
+    chunk_objects = pdf_service.split_text_into_chunks(raw_text, source_filename=filename)
+    chunk_texts = [c.text for c in chunk_objects]
+    chunk_metadatas = [c.metadata for c in chunk_objects]
+
+    embeddings = ai_service.generate_embeddings_batch(chunk_texts)
+    summary = ai_service.generate_summary(raw_text)
+
+    doc_record = db_service.save_document_metadata(
+        user_id=user_id,
+        file_name=filename,
+        file_url="",
+        summary=summary,
+        word_count=len(summary.split()) if summary else None,
+        batch_id=batch_id,
+    )
+    document_id = doc_record["id"]
+
+    db_service.store_document_chunks(
+        document_id=document_id,
+        chunks=chunk_texts,
+        embeddings=embeddings,
+        metadatas=chunk_metadatas,
+        batch_id=batch_id,
+    )
+
+    return doc_record, len(chunk_objects), summary
+
+
+# ── Endpoint 1a: Process Batch (Multiple PDFs in 1 Session) ───────────────────
+
+@app.post(
+    "/api/process-batch",
+    response_model=ProcessBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload & process multiple PDFs under one batch session",
+    tags=["Batches"],
+)
+async def process_batch(
+    files: list[UploadFile] = File(..., description="The PDF files to process together."),
+    user_id: str = Depends(get_current_user),
+):
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No files provided.",
+        )
+
+    # Compute descriptive title
+    if len(files) == 1:
+        batch_title = files[0].filename or "Document"
+    else:
+        batch_title = f"Batch ({len(files)} files): {', '.join([f.filename or 'doc' for f in files[:2]])}"
+        if len(files) > 2:
+            batch_title += "..."
+
+    batch_row = db_service.create_batch(user_id=user_id, title=batch_title)
+    batch_id = str(batch_row["id"])
+
+    succeeded_docs: list[BatchDocumentItem] = []
+    failed_items: list[BatchFailedItem] = []
+
+    # Fail-open loop: process each file independently
+    for file in files:
+        filename = file.filename or "unknown.pdf"
+        try:
+            if file.content_type not in ("application/pdf", "application/octet-stream") and not filename.lower().endswith(".pdf"):
+                raise ValueError("Only PDF files are accepted.")
+
+            file_bytes = await file.read()
+            doc_rec, chunk_count, summary = await _process_pdf_file_contents(
+                file_bytes=file_bytes,
+                filename=filename,
+                user_id=user_id,
+                batch_id=batch_id,
+            )
+            succeeded_docs.append(
+                BatchDocumentItem(
+                    document_id=str(doc_rec["id"]),
+                    file_name=filename,
+                    chunk_count=chunk_count,
+                    summary=summary,
+                    word_count=doc_rec.get("word_count"),
+                )
+            )
+        except Exception as exc:
+            failed_items.append(BatchFailedItem(filename=filename, error=str(exc)))
+
+    # If ALL files in the batch failed, clean up the empty batch shell and return 422
+    if not succeeded_docs:
+        db_service.delete_batch(batch_id=batch_id, user_id=user_id)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"All {len(files)} file(s) failed to process: {'; '.join([f'{it.filename}: {it.error}' for it in failed_items])}",
+        )
+
+    return ProcessBatchResponse(
+        batch_id=batch_id,
+        title=batch_title,
+        created_at=str(batch_row.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        documents=succeeded_docs,
+        failed=failed_items,
+        message=f"Processed {len(succeeded_docs)} of {len(files)} document(s) successfully.",
+    )
+
+
+# ── Endpoint 1b: Process Single PDF (Backward Compatible) ─────────────────────
 
 @app.post(
     "/api/process-pdf",
     response_model=ProcessPdfResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload & process a PDF",
+    summary="Upload & process a single PDF",
     tags=["Documents"],
 )
 async def process_pdf(
     file: UploadFile = File(..., description="The PDF file to process."),
     user_id: str = Depends(get_current_user),
 ):
+    filename = file.filename or "unknown.pdf"
     if file.content_type not in ("application/pdf", "application/octet-stream"):
-        if not (file.filename or "").lower().endswith(".pdf"):
+        if not filename.lower().endswith(".pdf"):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Only PDF files are accepted.",
@@ -225,72 +429,41 @@ async def process_pdf(
             detail=f"Failed to read uploaded file: {exc}",
         )
 
+    # Automatically create a 1-file batch for single upload
     try:
-        raw_text = pdf_service.extract_text_from_pdf(file_bytes)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        )
+        batch_row = db_service.create_batch(user_id=user_id, title=filename)
+        batch_id = str(batch_row["id"])
+    except Exception:
+        batch_id = None
 
     try:
-        chunk_objects = pdf_service.split_text_into_chunks(
-            raw_text, source_filename=file.filename or "unknown.pdf"
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        )
-
-    chunk_texts = [c.text for c in chunk_objects]
-    chunk_metadatas = [c.metadata for c in chunk_objects]
-
-    # Gemini embedding generation
-    try:
-        embeddings = ai_service.generate_embeddings_batch(chunk_texts)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Gemini embedding generation failed: {exc}",
-        )
-
-    # Groq API summary generation
-    try:
-        summary = ai_service.generate_summary(raw_text)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Groq summarisation failed: {exc}",
-        )
-
-    try:
-        doc_record = db_service.save_document_metadata(
+        doc_record, chunk_count, summary = await _process_pdf_file_contents(
+            file_bytes=file_bytes,
+            filename=filename,
             user_id=user_id,
-            file_name=file.filename or "unknown.pdf",
-            file_url="",
-            summary=summary,
-            word_count=len(summary.split()) if summary else None,
+            batch_id=batch_id,
         )
-        document_id = doc_record["id"]
-
-        db_service.store_document_chunks(
-            document_id=document_id,
-            chunks=chunk_texts,
-            embeddings=embeddings,
-            metadatas=chunk_metadatas,
+    except ValueError as exc:
+        if batch_id:
+            db_service.delete_batch(batch_id=batch_id, user_id=user_id)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
         )
-    except (RuntimeError, ValueError, TypeError) as exc:
+    except Exception as exc:
+        if batch_id:
+            db_service.delete_batch(batch_id=batch_id, user_id=user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database operation failed: {exc}",
+            detail=f"Processing failed: {exc}",
         )
 
     return ProcessPdfResponse(
-        document_id=document_id,
-        file_name=file.filename or "unknown.pdf",
-        chunk_count=len(chunk_objects),
+        document_id=str(doc_record["id"]),
+        file_name=filename,
+        chunk_count=chunk_count,
         summary=summary,
+        batch_id=batch_id,
         message="PDF processed and stored successfully.",
     )
 
@@ -337,7 +510,7 @@ async def summarize(body: SummarizeRequest, user_id: str = Depends(get_current_u
 @app.post(
     "/api/chat",
     response_model=ChatResponse,
-    summary="Ask a question about a stored document (RAG)",
+    summary="Ask a question about a stored batch or document (RAG)",
     tags=["AI"],
 )
 async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
@@ -347,12 +520,27 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
             detail="Question must not be empty.",
         )
 
-    doc = db_service.get_document_by_id(body.document_id, user_id=user_id)
-    if not doc:
+    if not body.batch_id and not body.document_id:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found or you do not have permission to access it.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Must provide either 'batch_id' or 'document_id'.",
         )
+
+    # Verify ownership
+    if body.batch_id:
+        batch = db_service.get_batch_by_id(body.batch_id, user_id=user_id)
+        if not batch:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Batch not found or you do not have permission to access it.",
+            )
+    elif body.document_id:
+        doc = db_service.get_document_by_id(body.document_id, user_id=user_id)
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found or you do not have permission to access it.",
+            )
 
     try:
         query_embedding = ai_service.generate_query_embedding(body.question)
@@ -362,14 +550,22 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
             detail=f"Failed to generate query embedding: {exc}",
         )
 
-    RAG_MATCH_COUNT = 5
+    RAG_MATCH_COUNT = 8 if body.batch_id else 5
     try:
-        context_chunks = db_service.search_similar_chunks(
-            document_id=body.document_id,
-            query_embedding=query_embedding,
-            match_count=RAG_MATCH_COUNT,
-            match_threshold=0.0,
-        )
+        if body.batch_id:
+            context_chunks = db_service.search_similar_chunks_by_batch(
+                batch_id=body.batch_id,
+                query_embedding=query_embedding,
+                match_count=RAG_MATCH_COUNT,
+                match_threshold=0.0,
+            )
+        else:
+            context_chunks = db_service.search_similar_chunks(
+                document_id=body.document_id,
+                query_embedding=query_embedding,
+                match_count=RAG_MATCH_COUNT,
+                match_threshold=0.0,
+            )
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -390,6 +586,7 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
 
     return ChatResponse(
         document_id=body.document_id,
+        batch_id=body.batch_id,
         question=body.question,
         answer=answer,
         sources_used=len(context_chunks),
