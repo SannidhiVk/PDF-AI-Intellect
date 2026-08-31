@@ -197,7 +197,7 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
         } else if (err.response?.status === 404) {
           errText = "Document not found. It may have been deleted.";
         } else if (!err.response) {
-          errText = "Could not reach the server. Make sure the backend is running on port 8000.";
+          errText = `Could not reach the backend server (${FASTAPI_URL}). If using Render free tier, the backend might be waking up from sleep (takes ~50 seconds). Please verify NEXT_PUBLIC_FASTAPI_URL in your Vercel settings and try again in a moment.`;
         }
       }
 

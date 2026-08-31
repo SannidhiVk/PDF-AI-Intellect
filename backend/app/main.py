@@ -45,25 +45,25 @@ async def lifespan(app: FastAPI):
     missing = [name for name, val in required_vars.items() if not val]
     if missing:
         raise RuntimeError(
-            f"❌ Missing environment variable(s): {', '.join(missing)}. "
+            f"[ERROR] Missing environment variable(s): {', '.join(missing)}. "
             "Ensure backend/.env exists and contains all required keys."
         )
 
     def _mask(val: str) -> str:
         return val[:6] + "*" * (len(val) - 6) if len(val) > 6 else "***"
 
-    print("🚀 PDF AI Assistant backend is starting up…")
-    print("✅ Configuration check: Required keys loaded successfully")
-    print(f"     SUPABASE_URL   → {required_vars['SUPABASE_URL']}")
-    print(f"     SUPABASE_KEY   → {_mask(required_vars['SUPABASE_KEY'])}")
-    print(f"     GROQ_API_KEY   → {_mask(required_vars['GROQ_API_KEY'])}")
-    print(f"     GEMINI_API_KEY → {_mask(required_vars['GEMINI_API_KEY'])}")
+    print("[INFO] PDF AI Assistant backend is starting up...")
+    print("[OK] Configuration check: Required keys loaded successfully")
+    print(f"     SUPABASE_URL   -> {required_vars['SUPABASE_URL']}")
+    print(f"     SUPABASE_KEY   -> {_mask(required_vars['SUPABASE_KEY'])}")
+    print(f"     GROQ_API_KEY   -> {_mask(required_vars['GROQ_API_KEY'])}")
+    print(f"     GEMINI_API_KEY -> {_mask(required_vars['GEMINI_API_KEY'])}")
 
-    print("✅ Embeddings: using Gemini API (gemini-embedding-001, 768 dims)")
+    print("[OK] Embeddings: using Gemini API (gemini-embedding-001, 768 dims)")
 
     yield
 
-    print("🛑 PDF AI Assistant backend is shutting down…")
+    print("[INFO] PDF AI Assistant backend is shutting down...")
 
 
 # ── App Initialisation ─────────────────────────────────────────────────────────
@@ -91,11 +91,26 @@ _allowed_origins = list(filter(None, [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
+    allow_origins=_allowed_origins if _allowed_origins else ["*"],
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically allow all Vercel deployments and preview URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Health Check ───────────────────────────────────────────────────────────────
+
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render and deployment platforms."""
+    return {
+        "status": "ok",
+        "service": "PDF AI Assistant API",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 
 # ── Request / Response Schemas ────────────────────────────────────────────────
