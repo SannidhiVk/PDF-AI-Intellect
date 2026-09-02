@@ -694,6 +694,25 @@ def revoke_share(document_id: str, user_id: str) -> bool:
     return bool(response.data)
 
 
+def revoke_share_by_token(token: str) -> bool:
+    """
+    Set is_active=False on a share row identified by its token UUID.
+
+    Used by the lazy-expiry path in _get_active_share() where we have the
+    token but not the owner's user_id. Uses the service-role client so
+    it bypasses RLS (same reason as all other share-management functions).
+
+    Returns True if a row was updated, False otherwise.
+    """
+    response = (
+        _get_service_client().table("document_shares")
+        .update({"is_active": False})
+        .eq("share_token", token)
+        .execute()
+    )
+    return bool(response.data)
+
+
 def get_share_by_token(token: str) -> dict[str, Any] | None:
     """
     Fetch an *active* share row by its token UUID.

@@ -9,3 +9,7 @@ python-multipart==0.0.18
 httpx==0.27.2
 google-genai
 #ollama==0.6.2
+tenacity
+slowapi==0.1.9
+limits==3.14.1
+pydantic[email]

@@ -13,21 +13,32 @@ Run locally with:
 """
 
 import os
+import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ══ MUST be first: populate os.environ from .env BEFORE importing services ══
 from dotenv import load_dotenv
 load_dotenv()  # noqa: E402 — intentionally before service imports
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status  # noqa: E402
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
+from pydantic import BaseModel, EmailStr, Field  # noqa: E402
+from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
 from typing import Literal, Optional  # noqa: E402
+
+from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
+from slowapi.util import get_remote_address  # noqa: E402
+from slowapi.errors import RateLimitExceeded  # noqa: E402
 
 from app.auth import get_current_user  # noqa: E402
 from app.services import ai_service, db_service, pdf_service  # noqa: E402
+import asyncio
 
+# ── Rate Limiter (SlowAPI — per-IP token bucket) ──────────────────────────────
+# Key function: identify callers by their real IP.
+# SlowAPI reads X-Forwarded-For automatically when behind a proxy (Render/Vercel).
+limiter = Limiter(key_func=get_remote_address)
 # ── Lifespan (startup / shutdown hooks) ───────────────────────────────────────
 
 @asynccontextmanager
@@ -80,6 +91,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Attach limiter state + global 429 handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
 
 _frontend_url = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
@@ -97,6 +112,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Security Headers Middleware ────────────────────────────────────────────────
+# Adds defensive HTTP response headers on every response to harden against
+# common browser-level attacks (clickjacking, MIME-sniffing, etc.).
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # ── Health Check ───────────────────────────────────────────────────────────────
@@ -148,7 +180,11 @@ class ProcessBatchResponse(BaseModel):
 
 class SummarizeRequest(BaseModel):
     document_id: str | None = None
-    text: str | None = None
+    text: str | None = Field(
+        default=None,
+        max_length=50_000,
+        description="Raw text to summarise. Maximum 50,000 characters.",
+    )
 
 
 class SummarizeResponse(BaseModel):
@@ -175,14 +211,23 @@ class BatchListItem(BaseModel):
 
 class ChatHistoryItem(BaseModel):
     role: Literal["user", "assistant"]
-    content: str
+    content: str = Field(..., max_length=4000)
 
 
 class ChatRequest(BaseModel):
     document_id: str | None = None
     batch_id: str | None = None
-    question: str
-    chat_history: list[ChatHistoryItem] = []
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The question to ask. Maximum 2,000 characters.",
+    )
+    chat_history: list[ChatHistoryItem] = Field(
+        default=[],
+        max_length=20,
+        description="Up to 20 previous conversation turns.",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -194,6 +239,20 @@ class ChatResponse(BaseModel):
 
 
 # ── Health Check ───────────────────────────────────────────────────────────────
+
+# ── File Size Constant ─────────────────────────────────────────────────────────
+MAX_PDF_BYTES = 20 * 1024 * 1024  # 20 MB hard cap per PDF file
+
+# ── Share Expiry Constant ──────────────────────────────────────────────────────
+SHARE_EXPIRY_DAYS = 10
+
+# ── Share Token Regex (UUID format only) ──────────────────────────────────────
+# Reject non-UUID tokens before they touch Postgres — prevents path-traversal
+# probes and avoids a raw 22P02 Postgres error on malformed input.
+_TOKEN_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -347,7 +406,9 @@ async def _process_pdf_file_contents(
     summary="Upload & process multiple PDFs under one batch session",
     tags=["Batches"],
 )
+@limiter.limit("5/minute")
 async def process_batch(
+    request: Request,
     files: list[UploadFile] = File(..., description="The PDF files to process together."),
     user_id: str = Depends(get_current_user),
 ):
@@ -372,13 +433,23 @@ async def process_batch(
     failed_items: list[BatchFailedItem] = []
 
     # Fail-open loop: process each file independently
-    for file in files:
+    for i, file in enumerate(files):
         filename = file.filename or "unknown.pdf"
         try:
+            if i > 0:
+                await asyncio.sleep(1.5)
             if file.content_type not in ("application/pdf", "application/octet-stream") and not filename.lower().endswith(".pdf"):
                 raise ValueError("Only PDF files are accepted.")
 
             file_bytes = await file.read()
+
+            # ── Hard file-size cap ────────────────────────────────────────────
+            if len(file_bytes) > MAX_PDF_BYTES:
+                raise ValueError(
+                    f"File exceeds the 20 MB limit "
+                    f"({len(file_bytes) // 1_048_576} MB uploaded). "
+                    "Please compress or split your PDF."
+                )
             doc_rec, chunk_count, summary = await _process_pdf_file_contents(
                 file_bytes=file_bytes,
                 filename=filename,
@@ -424,7 +495,9 @@ async def process_batch(
     summary="Upload & process a single PDF",
     tags=["Documents"],
 )
+@limiter.limit("5/minute")
 async def process_pdf(
+    request: Request,
     file: UploadFile = File(..., description="The PDF file to process."),
     user_id: str = Depends(get_current_user),
 ):
@@ -442,6 +515,17 @@ async def process_pdf(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to read uploaded file: {exc}",
+        )
+
+    # ── Hard file-size cap ────────────────────────────────────────────────────
+    if len(file_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"File exceeds the 20 MB limit "
+                f"({len(file_bytes) // 1_048_576} MB uploaded). "
+                "Please compress or split your PDF."
+            ),
         )
 
     # Automatically create a 1-file batch for single upload
@@ -491,7 +575,8 @@ async def process_pdf(
     summary="Generate a structured PDF summary",
     tags=["AI"],
 )
-async def summarize(body: SummarizeRequest, user_id: str = Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def summarize(request: Request, body: SummarizeRequest, user_id: str = Depends(get_current_user)):
     if not body.document_id and not body.text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -528,7 +613,8 @@ async def summarize(body: SummarizeRequest, user_id: str = Depends(get_current_u
     summary="Ask a question about a stored batch or document (RAG)",
     tags=["AI"],
 )
-async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def chat(request: Request, body: ChatRequest, user_id: str = Depends(get_current_user)):
     if not body.question.strip():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -560,6 +646,11 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
     try:
         query_embedding = ai_service.generate_query_embedding(body.question)
     except Exception as exc:
+        if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="AI service is temporarily busy — please wait a few seconds and try again.",
+            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to generate query embedding: {exc}",
@@ -611,9 +702,23 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
 # ── Endpoint 3b: Multi-Document Chat (RAG across multiple docs) ───────────────
 
 class MultiChatRequest(BaseModel):
-    document_ids: list[str]
-    question: str
-    chat_history: list[ChatHistoryItem] = []
+    document_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=10,
+        description="Between 1 and 10 document IDs.",
+    )
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The question to ask. Maximum 2,000 characters.",
+    )
+    chat_history: list[ChatHistoryItem] = Field(
+        default=[],
+        max_length=20,
+        description="Up to 20 previous conversation turns.",
+    )
 
 
 class MultiChatResponse(BaseModel):
@@ -629,7 +734,8 @@ class MultiChatResponse(BaseModel):
     summary="Ask a question across multiple documents (RAG)",
     tags=["AI"],
 )
-async def chat_multi(body: MultiChatRequest, user_id: str = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def chat_multi(request: Request, body: MultiChatRequest, user_id: str = Depends(get_current_user)):
     """
     RAG-based Q&A that retrieves context from multiple documents at once.
     All document IDs must belong to the authenticated user.
@@ -721,8 +827,18 @@ class ShareInfoResponse(BaseModel):
 
 
 class CommentCreate(BaseModel):
-    content: str
-    author_name: str = "Anonymous"
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Comment body. Maximum 1,000 characters.",
+    )
+    author_name: str = Field(
+        default="Anonymous",
+        min_length=1,
+        max_length=80,
+        description="Display name. Maximum 80 characters.",
+    )
     parent_id: Optional[str] = None
 
 
@@ -740,8 +856,17 @@ CommentResponse.model_rebuild()
 
 
 class ShareChatRequest(BaseModel):
-    question: str
-    chat_history: list[ChatHistoryItem] = []
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The question to ask. Maximum 2,000 characters.",
+    )
+    chat_history: list[ChatHistoryItem] = Field(
+        default=[],
+        max_length=20,
+        description="Up to 20 previous conversation turns.",
+    )
 
 
 class ShareChatHistoryMessage(BaseModel):
@@ -757,7 +882,8 @@ class ShareChatHistoryMessage(BaseModel):
     summary="Get persisted chat history for a share link (public)",
     tags=["Sharing"],
 )
-async def get_share_chat_history(token: str):
+@limiter.limit("30/minute")
+async def get_share_chat_history(request: Request, token: str):
     """
     Returns all saved chat messages for the given share token, ordered
     oldest-first. Used by the frontend to restore conversation history
@@ -786,12 +912,57 @@ async def get_share_chat_history(token: str):
 
 
 def _get_active_share(token: str) -> dict:
+    """
+    Validate a share token and return the active share row.
+
+    Guards applied (in order):
+      1. UUID regex — fast-fail non-UUID tokens before hitting Postgres.
+      2. DB lookup  — returns None if revoked or not found.
+      3. Expiry     — lazy-revoke shares older than SHARE_EXPIRY_DAYS days.
+    """
+    # 1. Reject non-UUID tokens immediately (prevents path-traversal probes)
+    if not _TOKEN_RE.match(token.lower()):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This share link is no longer active or does not exist.",
+        )
+
+    # 2. DB lookup
     share = db_service.get_share_by_token(token)
     if not share:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This share link is no longer active or does not exist.",
         )
+
+    # 3. Lazy expiry: auto-revoke shares older than SHARE_EXPIRY_DAYS
+    created_at_str = share.get("created_at", "")
+    if created_at_str:
+        try:
+            created_at = datetime.fromisoformat(
+                str(created_at_str).replace("Z", "+00:00")
+            )
+            age = datetime.now(timezone.utc) - created_at
+            if age > timedelta(days=SHARE_EXPIRY_DAYS):
+                # Best-effort revocation in DB — non-fatal if the call fails
+                try:
+                    db_service.revoke_share_by_token(token)
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        f"This share link has expired. "
+                        f"Share links are valid for {SHARE_EXPIRY_DAYS} days."
+                    ),
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            # If we can't parse the timestamp, allow access rather than
+            # silently breaking existing shares.
+            pass
+
     return share
 
 
@@ -899,7 +1070,8 @@ async def get_share_info(token: str):
     summary="RAG chat via share link (public)",
     tags=["Sharing"],
 )
-async def share_chat(token: str, body: ShareChatRequest):
+@limiter.limit("10/minute")
+async def share_chat(request: Request, token: str, body: ShareChatRequest):
     share = _get_active_share(token)
     document_id = share["document_id"]
 
@@ -969,7 +1141,8 @@ async def share_chat(token: str, body: ShareChatRequest):
     summary="List comments for a shared document (public)",
     tags=["Comments"],
 )
-async def list_shared_comments(token: str):
+@limiter.limit("30/minute")
+async def list_shared_comments(request: Request, token: str):
     share = _get_active_share(token)
     flat = db_service.get_comments(share["document_id"])
     return _thread_comments(flat, requesting_user_id=None)
@@ -982,7 +1155,8 @@ async def list_shared_comments(token: str):
     summary="Post a comment on a shared document (guests welcome)",
     tags=["Comments"],
 )
-async def post_shared_comment(token: str, body: CommentCreate):
+@limiter.limit("5/minute")
+async def post_shared_comment(request: Request, token: str, body: CommentCreate):
     share = _get_active_share(token)
 
     if not body.content.strip():
@@ -1104,8 +1278,13 @@ async def delete_comment(
 # ════════════════════════════════════════════════════════════════════════════
 
 class ShareInviteRequest(BaseModel):
-    recipient_email: str
-    sender_name: str = "Someone"
+    recipient_email: EmailStr  # Validates email format (requires pydantic[email])
+    sender_name: str = Field(
+        default="Someone",
+        min_length=1,
+        max_length=80,
+        description="Display name of the sender. Maximum 80 characters.",
+    )
 
 
 @app.post(
@@ -1114,7 +1293,9 @@ class ShareInviteRequest(BaseModel):
     summary="Send a share-link invitation email to a recipient via Brevo",
     tags=["Sharing"],
 )
+@limiter.limit("3/minute")
 async def send_share_invite(
+    request: Request,
     document_id: str,
     body: ShareInviteRequest,
     user_id: str = Depends(get_current_user),

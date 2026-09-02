@@ -13,6 +13,14 @@ Google's Gemini API, which offers a genuine free tier and supports
 `output_dimensionality=768` natively (Matryoshka Representation Learning),
 so the output vector matches the existing Supabase pgvector column
 (`vector(768)`) with zero schema migration required.
+
+RATE LIMIT HANDLING:
+`gemini-embedding-001` has a fairly low free-tier requests-per-minute quota.
+All embedding calls below are wrapped with exponential-backoff retry (via
+`tenacity`) so transient 429 RESOURCE_EXHAUSTED errors are absorbed
+automatically instead of failing the whole request. Only 429/RESOURCE_EXHAUSTED
+errors are retried — auth errors, invalid input, etc. fail immediately since
+retrying won't help.
 """
 
 import os
@@ -21,10 +29,21 @@ import textwrap
 from groq import Groq
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 from dotenv import load_dotenv
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception,
+    before_sleep_log,
+)
+import logging
 
 load_dotenv()
 load_dotenv("backend/.env")
+
+logger = logging.getLogger("ai_service")
 
 # ── Groq Connection (Summaries & RAG Chat only) ─────────────────────────────
 _GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -36,6 +55,33 @@ _GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 _gemini_client = genai.Client(api_key=_GEMINI_API_KEY) if _GEMINI_API_KEY else None
 EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001").strip()
 EMBEDDING_DIMENSION = 768  # matches existing Supabase pgvector column — do not change without a migration
+
+
+# ── Retry helper: only retry on 429 / RESOURCE_EXHAUSTED ────────────────────
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True only for quota/rate-limit errors — not auth or bad-input errors."""
+    msg = str(exc)
+    if isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        if code == 429:
+            return True
+    return "RESOURCE_EXHAUSTED" in msg or "429" in msg
+
+
+_embedding_retry = retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    retry=retry_if_exception(_is_rate_limit_error),
+    reraise=True,
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+
+
+@_embedding_retry
+def _embed_call(client: genai.Client, model: str, contents, config: types.EmbedContentConfig):
+    """Low-level Gemini embed_content call, wrapped with backoff retry on 429s."""
+    return client.models.embed_content(model=model, contents=contents, config=config)
 
 
 # ── Embedding Functions (Gemini) ─────────────────────────────────────────────
@@ -59,10 +105,11 @@ def generate_embedding(text: str) -> list[float]:
     """Generate a 768-dim vector embedding for a single text chunk."""
     client = _require_gemini_client()
     try:
-        response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
+        response = _embed_call(
+            client,
+            EMBEDDING_MODEL,
+            text,
+            types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
         )
         return response.embeddings[0].values
     except Exception as exc:
@@ -70,17 +117,22 @@ def generate_embedding(text: str) -> list[float]:
 
 
 def generate_embeddings_batch(chunks: list[str]) -> list[list[float]]:
-    """Generate embeddings for a list of text chunks in a single batched call."""
+    """Generate embeddings for a list of text chunks in a single batched call.
+
+    Always prefer this over calling generate_embedding() in a loop — one batched
+    request uses far less of the per-minute quota than N individual requests.
+    """
     if not chunks:
         return []
 
     client = _require_gemini_client()
 
     try:
-        response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=chunks,
-            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
+        response = _embed_call(
+            client,
+            EMBEDDING_MODEL,
+            chunks,
+            types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
         )
         return [item.values for item in response.embeddings]
     except Exception as exc:
@@ -91,10 +143,11 @@ def generate_query_embedding(query: str) -> list[float]:
     """Generate an embedding vector for a user search query."""
     client = _require_gemini_client()
     try:
-        response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=query,
-            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
+        response = _embed_call(
+            client,
+            EMBEDDING_MODEL,
+            query,
+            types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSION),
         )
         return response.embeddings[0].values
     except Exception as exc:
