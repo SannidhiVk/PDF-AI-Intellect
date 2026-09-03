@@ -93,9 +93,11 @@ CREATE TABLE IF NOT EXISTS public.documents (
 CREATE TABLE IF NOT EXISTS public.document_chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
+    batch_id UUID,                 -- Optional: links chunk to an upload_batches row for multi-doc/batch chat
     chunk_index INT NOT NULL,
     content TEXT NOT NULL,
     embedding VECTOR(768) NOT NULL,
+    metadata JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -151,6 +153,56 @@ BEGIN
 END;
 $$;
 
+-- 6b. Multi-document vector search RPC (chat across several selected PDFs at once)
+CREATE OR REPLACE FUNCTION match_document_chunks_multi (
+    query_embedding VECTOR(768),
+    filter_document_ids UUID[],
+    match_count INT DEFAULT 8
+)
+RETURNS TABLE (
+    id UUID,
+    document_id UUID,
+    content TEXT,
+    similarity FLOAT
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        dc.id,
+        dc.document_id,
+        dc.content,
+        1 - (dc.embedding <=> query_embedding) AS similarity
+    FROM public.document_chunks dc
+    WHERE dc.document_id = ANY(filter_document_ids)
+    ORDER BY dc.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- 6c. Batch-scoped vector search RPC (chat across an entire upload batch)
+CREATE OR REPLACE FUNCTION match_batch_chunks (
+    query_embedding VECTOR(768),
+    filter_batch_id UUID,
+    match_count INT DEFAULT 8
+)
+RETURNS TABLE (
+    id UUID,
+    document_id UUID,
+    content TEXT,
+    similarity FLOAT
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        dc.id,
+        dc.document_id,
+        dc.content,
+        1 - (dc.embedding <=> query_embedding) AS similarity
+    FROM public.document_chunks dc
+    WHERE dc.batch_id = filter_batch_id
+    ORDER BY dc.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
 -- 7. Enable Row Level Security (RLS)
 ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.document_chunks ENABLE ROW LEVEL SECURITY;
@@ -173,6 +225,15 @@ CREATE POLICY "Owners can manage their share links" ON public.document_shares
     FOR ALL USING (auth.uid() = created_by)
     WITH CHECK (auth.uid() = created_by);
 ```
+
+> **RPC functions created by this script:**
+> | Function | Used for |
+> |---|---|
+> | `match_document_chunks` | Chat scoped to a single document |
+> | `match_document_chunks_multi` | Chat across a manually-selected set of documents |
+> | `match_batch_chunks` | Chat across an entire upload batch |
+>
+> All three must exist before `/api/chat` will work — `backend/app/services/db_service.py` calls all three depending on the chat context. If any is missing, Supabase returns `PGRST202: Could not find the function ... in the schema cache`, which surfaces as a `500` from `/api/chat`.
 
 4. Go to **Project Settings → API** in Supabase and copy:
    - `Project URL` (`SUPABASE_URL`)
@@ -346,6 +407,31 @@ PDF AI-assistent/
 - **Service Role Scoping**: Backend database operations utilize Supabase `service_role` client for elevated vector search and share access while enforcing strict user ownership checks.
 - **No Vector Leakage**: Similarity searches are explicitly filtered by `filter_document_id` to prevent cross-document or cross-user context retrieval.
 - **Secret Management**: API keys (`GROQ_API_KEY`, `SUPABASE_SERVICE_KEY`, `BREVO_API_KEY`) are kept strictly on the backend inside environment variables and never exposed to the client.
+
+---
+
+## 🩺 Troubleshooting
+
+### `Could not reach the backend server` (frontend toast)
+Usually one of two things:
+1. **Render free-tier cold start** — the backend spins down after inactivity and takes ~50s to wake up. Just retry after a moment.
+2. **`NEXT_PUBLIC_FASTAPI_URL` misconfigured on Vercel** — check **Vercel → Project → Settings → Environment Variables**. It must:
+   - Be typed as **Config**, not **Secret** (Secret variables are write-only and can silently fail to save when combined with a `NEXT_PUBLIC_` prefix, since that prefix requires the value to be readable in the browser bundle).
+   - Have no trailing slash.
+   - Be applied to Production **and** Preview, then trigger a fresh **Redeploy** (Next.js bakes `NEXT_PUBLIC_*` vars in at build time — saving the variable alone does not apply it retroactively).
+
+### `500` on `/api/chat` with `PGRST202: Could not find the function ... in the schema cache`
+This means one of the three vector-search RPC functions (`match_document_chunks`, `match_document_chunks_multi`, `match_batch_chunks`) hasn't been created in your Supabase project yet. Re-run the full SQL setup script from **Step 1** above in **Supabase → SQL Editor** — it's idempotent (`CREATE OR REPLACE FUNCTION`), so it's safe to run again even if some functions already exist.
+
+To verify which functions currently exist in your project, run:
+```sql
+select routine_name
+from information_schema.routines
+where routine_type = 'FUNCTION' and routine_schema = 'public';
+```
+
+### CORS errors in the browser console
+Confirm `backend/app/main.py`'s `CORSMiddleware` `allow_origins` list includes your **exact** deployed Vercel domain (e.g. `https://your-app.vercel.app`), not just `localhost`.
 
 ---
 

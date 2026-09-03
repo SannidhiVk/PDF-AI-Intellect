@@ -362,9 +362,15 @@ def search_similar_chunks_multi(
     query_embedding: list[float],
     match_count: int = 8,
     match_threshold: float = 0.0,
-) -> list[str]:
+) -> list[dict[str, str]]:
     """
     Retrieve the top-K most semantically similar chunks across MULTIPLE documents.
+
+    Returns a list of {"text": ..., "source": ...} dicts (not plain strings) so
+    that downstream RAG generation (ai_service.generate_rag_answer) can group
+    its answer per source document instead of blending facts from different
+    PDFs together. `source` comes from the `file_name` column the
+    match_document_chunks_multi RPC returns via its JOIN with `documents`.
     """
     if not document_ids:
         raise ValueError("document_ids must contain at least one ID.")
@@ -388,7 +394,10 @@ def search_similar_chunks_multi(
         if row.get("similarity", 0) >= match_threshold
     ]
 
-    return [row["content"] for row in filtered_rows]
+    return [
+        {"text": row["content"], "source": row.get("file_name") or "Document"}
+        for row in filtered_rows
+    ]
 
 
 def search_similar_chunks_by_batch(
@@ -396,7 +405,7 @@ def search_similar_chunks_by_batch(
     query_embedding: list[float],
     match_count: int = 8,
     match_threshold: float = 0.0,
-) -> list[str]:
+) -> list[dict[str, str]]:
     """
     Retrieve the top-K most semantically similar chunks across an ENTIRE upload batch.
 
@@ -412,7 +421,10 @@ def search_similar_chunks_by_batch(
         match_threshold: Minimum cosine similarity.
 
     Returns:
-        List of content strings for top matching chunks.
+        List of {"text": ..., "source": ...} dicts for top matching chunks,
+        where `source` is the originating PDF's file_name. This lets
+        ai_service.generate_rag_answer attribute facts to the correct
+        document instead of merging multiple files' content together.
     """
     client = _get_service_client()
     try:
@@ -430,7 +442,10 @@ def search_similar_chunks_by_batch(
                 row for row in response.data
                 if row.get("similarity", 0) >= match_threshold
             ]
-            return [row["content"] for row in filtered_rows]
+            return [
+                {"text": row["content"], "source": row.get("file_name") or "Document"}
+                for row in filtered_rows
+            ]
     except Exception as exc:
         print(f"[search_similar_chunks_by_batch] Direct batch RPC failed ({exc}), falling back to multi-doc search.")
 
@@ -940,4 +955,4 @@ def save_share_chat_messages(
     try:
         _get_service_client().table("share_chat_messages").insert(rows).execute()
     except Exception as exc:
-        raise RuntimeError(f"Failed to save share chat messages: {exc}") from exc
+        raise RuntimeError(f"Failed to save share chat messages: {exc}") from exc

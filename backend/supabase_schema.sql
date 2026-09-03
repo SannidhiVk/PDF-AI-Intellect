@@ -1,170 +1,17 @@
 -- ============================================================
---  PDF AI Assistant – Supabase Database Setup
---  Run these statements in order in the Supabase SQL Editor
---  (Dashboard → SQL Editor → New Query)
+--  Migration: attach file_name to multi-document RPC results
+--  Run in Supabase Dashboard → SQL Editor → New Query
 -- ============================================================
-
-
--- ─────────────────────────────────────────────
--- STEP 1: Enable the pgvector extension
--- ─────────────────────────────────────────────
--- This must be run BEFORE creating any tables that use vector columns.
-CREATE EXTENSION IF NOT EXISTS vector;
-
+-- Why: document_chunks only stores document_id, not the filename.
+-- The batch/multi RPCs need to JOIN documents to return file_name so
+-- the backend can attribute each retrieved chunk to the right PDF
+-- (needed for organizing multi-file chat answers by source document).
 
 -- ─────────────────────────────────────────────
--- STEP 1b: Create the `upload_batches` table
+-- match_document_chunks_multi → add file_name
 -- ─────────────────────────────────────────────
--- Groups multiple documents uploaded in a single session.
-CREATE TABLE IF NOT EXISTS upload_batches (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    title       TEXT        NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+DROP FUNCTION IF EXISTS match_document_chunks_multi(vector(768), UUID[], INT);
 
-CREATE INDEX IF NOT EXISTS idx_batches_user_id ON upload_batches(user_id);
-
-ALTER TABLE upload_batches ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Users can view their own batches"
-    ON upload_batches FOR SELECT
-    USING (auth.uid() = user_id);
-
-CREATE POLICY "Users can insert their own batches"
-    ON upload_batches FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "Users can delete their own batches"
-    ON upload_batches FOR DELETE
-    USING (auth.uid() = user_id);
-
-
--- ─────────────────────────────────────────────
--- STEP 2: Create the `documents` table
--- ─────────────────────────────────────────────
--- Stores metadata for each uploaded PDF.
--- `user_id` references Supabase Auth's built-in auth.users table.
-CREATE TABLE IF NOT EXISTS documents (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    batch_id    UUID        REFERENCES upload_batches(id) ON DELETE CASCADE,
-    user_id     UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    file_name   TEXT        NOT NULL,
-    file_url    TEXT        NOT NULL DEFAULT '',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Index for fast lookup of all documents belonging to a user or batch
-CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
-CREATE INDEX IF NOT EXISTS idx_documents_batch_id ON documents(batch_id);
-
--- Row-Level Security: users can only access their own documents
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Users can view their own documents"
-    ON documents FOR SELECT
-    USING (auth.uid() = user_id);
-
-CREATE POLICY "Users can insert their own documents"
-    ON documents FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "Users can delete their own documents"
-    ON documents FOR DELETE
-    USING (auth.uid() = user_id);
-
-
--- ─────────────────────────────────────────────
--- STEP 3: Create the `document_chunks` table
--- ─────────────────────────────────────────────
--- Stores text chunks and their 768-dimensional Gemini embeddings.
--- The vector(768) column uses pgvector for cosine similarity search.
-CREATE TABLE IF NOT EXISTS document_chunks (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    batch_id    UUID        REFERENCES upload_batches(id) ON DELETE CASCADE,
-    content     TEXT        NOT NULL,
-    embedding   vector(768) NOT NULL,
-    metadata    JSONB       NOT NULL DEFAULT '{}'
-);
-
--- Index for fast document-level chunk lookup
-CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_batch_id ON document_chunks(batch_id);
-
--- IVFFlat index for approximate nearest-neighbour search (cosine distance).
--- Tune `lists` to roughly sqrt(total_rows) for best performance.
--- Re-create with a higher `lists` value as your data grows.
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON document_chunks
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
--- Row-Level Security (inherits access via documents)
-ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Users can view chunks of their own documents"
-    ON document_chunks FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM documents d
-            WHERE d.id = document_chunks.document_id
-            AND d.user_id = auth.uid()
-        )
-    );
-
-CREATE POLICY "Users can insert chunks for their own documents"
-    ON document_chunks FOR INSERT
-    WITH CHECK (
-        EXISTS (
-            SELECT 1 FROM documents d
-            WHERE d.id = document_chunks.document_id
-            AND d.user_id = auth.uid()
-        )
-    );
-
-
--- ─────────────────────────────────────────────
--- STEP 4: Create the vector similarity search RPC functions
--- ─────────────────────────────────────────────
--- This function is called from db_service.py via supabase.rpc().
--- It returns the top `match_count` chunks for a given document,
--- ordered by cosine similarity (highest first).
-CREATE OR REPLACE FUNCTION match_document_chunks(
-    query_embedding    vector(768),
-    filter_document_id UUID,
-    match_count        INT DEFAULT 5
-)
-RETURNS TABLE (
-    id          UUID,
-    document_id UUID,
-    content     TEXT,
-    similarity  FLOAT
-)
-LANGUAGE plpgsql VOLATILE
-AS $$
-BEGIN
-    SET LOCAL ivfflat.probes = 10;
-
-    RETURN QUERY
-        SELECT
-            dc.id,
-            dc.document_id,
-            dc.content,
-            1 - (dc.embedding <=> query_embedding) AS similarity
-        FROM document_chunks dc
-        WHERE dc.document_id = filter_document_id
-        ORDER BY dc.embedding <=> query_embedding
-        LIMIT match_count;
-END;
-$$;
-
-
--- ─────────────────────────────────────────────
--- STEP 4b: Multi-document vector similarity search RPC function
--- ─────────────────────────────────────────────
--- Same as match_document_chunks but accepts an ARRAY of document UUIDs.
--- Used by POST /api/chat/multi to search across multiple docs at once.
 CREATE OR REPLACE FUNCTION match_document_chunks_multi(
     query_embedding     vector(768),
     filter_document_ids UUID[],
@@ -173,6 +20,7 @@ CREATE OR REPLACE FUNCTION match_document_chunks_multi(
 RETURNS TABLE (
     id          UUID,
     document_id UUID,
+    file_name   TEXT,
     content     TEXT,
     similarity  FLOAT
 )
@@ -185,9 +33,11 @@ BEGIN
         SELECT
             dc.id,
             dc.document_id,
+            d.file_name,
             dc.content,
             1 - (dc.embedding <=> query_embedding) AS similarity
         FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
         WHERE dc.document_id = ANY(filter_document_ids)
         ORDER BY dc.embedding <=> query_embedding
         LIMIT match_count;
@@ -196,9 +46,10 @@ $$;
 
 
 -- ─────────────────────────────────────────────
--- STEP 4c: Batch vector similarity search RPC function
+-- match_batch_chunks → add file_name
 -- ─────────────────────────────────────────────
--- Returns top matching chunks across all documents in an upload batch.
+DROP FUNCTION IF EXISTS match_batch_chunks(vector(768), UUID, INT);
+
 CREATE OR REPLACE FUNCTION match_batch_chunks(
     query_embedding    vector(768),
     filter_batch_id    UUID,
@@ -208,6 +59,7 @@ RETURNS TABLE (
     id          UUID,
     document_id UUID,
     batch_id    UUID,
+    file_name   TEXT,
     content     TEXT,
     similarity  FLOAT
 )
@@ -221,151 +73,13 @@ BEGIN
             dc.id,
             dc.document_id,
             dc.batch_id,
+            d.file_name,
             dc.content,
             1 - (dc.embedding <=> query_embedding) AS similarity
         FROM document_chunks dc
+        JOIN documents d ON d.id = dc.document_id
         WHERE dc.batch_id = filter_batch_id
         ORDER BY dc.embedding <=> query_embedding
         LIMIT match_count;
 END;
 $$;
-
-
-
-
--- ─────────────────────────────────────────────
--- STEP 5: Create the `document_shares` table
--- ─────────────────────────────────────────────
--- Each row represents a unique shareable link for one document.
--- share_token is a random UUID used directly in the URL: /share/<share_token>
--- Setting is_active = FALSE effectively revokes the link without deleting it.
-CREATE TABLE IF NOT EXISTS document_shares (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    share_token UUID        NOT NULL UNIQUE DEFAULT gen_random_uuid(),
-    created_by  UUID        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    is_active   BOOLEAN     NOT NULL DEFAULT TRUE
-);
-
-CREATE INDEX IF NOT EXISTS idx_shares_document_id ON document_shares(document_id);
-CREATE INDEX IF NOT EXISTS idx_shares_token       ON document_shares(share_token);
-
--- RLS: authenticated owners can manage their own share links.
--- Public (token-validated) reads are done server-side with the service-role key,
--- so they bypass RLS entirely — no anon SELECT policy needed.
-ALTER TABLE document_shares ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Owners can manage their share links"
-    ON document_shares FOR ALL
-    USING (auth.uid() = created_by)
-    WITH CHECK (auth.uid() = created_by);
-
-CREATE POLICY "Anyone can view active share links"
-    ON document_shares FOR SELECT
-    USING (is_active = true);
-
-
--- ─────────────────────────────────────────────
--- STEP 6: Create the `document_comments` table
--- ─────────────────────────────────────────────
--- Stores comments and one-level replies on a document.
--- parent_id = NULL  → top-level comment
--- parent_id = <id>  → reply to that comment (one level deep)
--- user_id = NULL    → guest commenter (no Supabase account)
--- author_name       → display name (always set; pulled from profile for auth users)
-CREATE TABLE IF NOT EXISTS document_comments (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    parent_id   UUID        REFERENCES document_comments(id) ON DELETE CASCADE,
-    user_id     UUID        REFERENCES auth.users(id) ON DELETE SET NULL,
-    author_name TEXT        NOT NULL DEFAULT 'Anonymous',
-    content     TEXT        NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_comments_document_id ON document_comments(document_id);
-CREATE INDEX IF NOT EXISTS idx_comments_parent_id   ON document_comments(parent_id);
-
--- RLS: The document owner can SELECT all comments on their docs.
--- Anyone can view / post comments on documents with active share links.
-ALTER TABLE document_comments ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Document owner can view all comments"
-    ON document_comments FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM documents d
-            WHERE d.id = document_comments.document_id
-              AND d.user_id = auth.uid()
-        )
-    );
-
-CREATE POLICY "Anyone can view comments on active shared documents"
-    ON document_comments FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM document_shares s
-            WHERE s.document_id = document_comments.document_id
-              AND s.is_active = true
-        )
-    );
-
-CREATE POLICY "Authenticated users can post comments"
-    ON document_comments FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "Anyone can post comments on active shared documents"
-    ON document_comments FOR INSERT
-    WITH CHECK (
-        EXISTS (
-            SELECT 1 FROM document_shares s
-            WHERE s.document_id = document_comments.document_id
-              AND s.is_active = true
-        )
-    );
-
-CREATE POLICY "Users can delete their own comments"
-    ON document_comments FOR DELETE
-    USING (auth.uid() = user_id);
-
-CREATE POLICY "Document owner can delete any comment"
-    ON document_comments FOR DELETE
-    USING (
-        EXISTS (
-            SELECT 1 FROM documents d
-            WHERE d.id = document_comments.document_id
-              AND d.user_id = auth.uid()
-        )
-    );
-
-
--- ─────────────────────────────────────────────
--- STEP 7: Create the `share_chat_messages` table
--- ─────────────────────────────────────────────
--- Persists the AI chat conversation for each share link so that all
--- visitors to the same link see the full conversation history.
--- share_token is the TEXT representation of the UUID from document_shares.
--- No user_id column — access is controlled by possessing the share token.
-CREATE TABLE IF NOT EXISTS share_chat_messages (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    share_token TEXT        NOT NULL,
-    role        TEXT        NOT NULL CHECK (role IN ('user', 'assistant')),
-    content     TEXT        NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Index for efficiently fetching ordered history per share token
-CREATE INDEX IF NOT EXISTS idx_share_chat_token_time
-    ON share_chat_messages(share_token, created_at ASC);
-
--- RLS: public access — the share token itself is the access credential
-ALTER TABLE share_chat_messages ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "Anyone can read chat history for a share token"
-    ON share_chat_messages FOR SELECT
-    USING (true);
-
-CREATE POLICY "Anyone can insert messages for a share token"
-    ON share_chat_messages FOR INSERT
-    WITH CHECK (true);

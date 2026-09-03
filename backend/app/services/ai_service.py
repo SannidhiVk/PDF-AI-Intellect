@@ -236,6 +236,15 @@ _RAG_SYSTEM_PROMPT = textwrap.dedent("""\
     - If listing items, list ONLY the items asked for using clean markdown bullet points (`- `). Leave an empty line between bullets.
     - Never add concluding summary paragraphs, closing remarks, or extra commentary at the end.
 
+    MULTI-DOCUMENT RULE (applies whenever the context below contains more than one SOURCE):
+    - Never merge facts from different sources into one undifferentiated list.
+    - Group your answer per source. Start each source's section with the exact
+      source name as a bold sub-heading on its own line — e.g. **Sannidhi_VK_Resume.pdf** —
+      followed only by that source's bullet points.
+    - Leave a blank line between one source's section and the next.
+    - If the question only concerns one person/document (e.g. "which college did
+      Sannidhi study in"), answer only for that source — do not mention the others.
+
     GROUNDING RULES:
     - Base your answer strictly on the provided context chunks.
     - If the context does not contain the answer to the specific question, state strictly: "I couldn't find a direct answer to your question in this document."
@@ -244,20 +253,42 @@ _RAG_SYSTEM_PROMPT = textwrap.dedent("""\
 
 def generate_rag_answer(
     question: str,
-    context_chunks: list[str],
+    context_chunks: list[dict] | list[str],
     chat_history: list[dict] | None = None,
 ) -> str:
-    """Generate a grounded answer using Groq based on retrieved document chunks."""
+    """Generate a grounded answer using Groq based on retrieved document chunks.
+
+    context_chunks accepts either:
+      - list[dict]: [{"text": "...", "source": "Sannidhi_VK_Resume.pdf"}, ...]
+        (preferred for batch/multi-file chats — lets the model attribute facts
+        to the correct document instead of blending them together)
+      - list[str]: plain text chunks (backwards-compatible; all treated as
+        coming from a single unnamed "Document" source)
+    """
     if not _groq_client:
         raise RuntimeError("GROQ_API_KEY is missing from your .env file.")
 
     if not context_chunks:
         return "I couldn't find any relevant content in this document to answer your question."
 
-    # Format context chunks
-    context_block = "\n\n---\n\n".join(
-        f"[Chunk {i + 1}]:\n{chunk}"
-        for i, chunk in enumerate(context_chunks)
+    # Normalize every chunk into a (source, text) pair regardless of input shape
+    normalized: list[tuple[str, str]] = []
+    for chunk in context_chunks:
+        if isinstance(chunk, dict):
+            normalized.append((chunk.get("source") or "Document", chunk.get("text", "")))
+        else:
+            normalized.append(("Document", chunk))
+
+    # Group chunks by source, preserving first-seen order, so each document's
+    # chunks stay together instead of being interleaved
+    grouped: dict[str, list[str]] = {}
+    for source, text in normalized:
+        grouped.setdefault(source, []).append(text)
+
+    context_block = "\n\n".join(
+        f"=== SOURCE: {source} ===\n"
+        + "\n---\n".join(f"[Chunk {i + 1}]: {text}" for i, text in enumerate(texts))
+        for source, texts in grouped.items()
     )
 
     # Initialize messages array natively with system prompt
