@@ -131,6 +131,36 @@ export default function DashboardPage() {
     }
   }, [loading, user, router]);
 
+  // Restore active view & selected batch from localStorage on mount
+  useEffect(() => {
+    try {
+      const savedBatchId = localStorage.getItem("pdf_selected_batch_id");
+      const savedView = localStorage.getItem("pdf_active_view") as ActiveView | null;
+      if (savedBatchId) setSelectedBatchId(savedBatchId);
+      if (savedView === "upload" || savedView === "chat") setActiveView(savedView);
+    } catch {}
+  }, []);
+
+  // Persist selectedBatchId to localStorage
+  useEffect(() => {
+    try {
+      if (selectedBatchId) {
+        localStorage.setItem("pdf_selected_batch_id", selectedBatchId);
+      } else {
+        localStorage.removeItem("pdf_selected_batch_id");
+      }
+    } catch {}
+  }, [selectedBatchId]);
+
+  // Persist activeView to localStorage
+  useEffect(() => {
+    try {
+      if (activeView) {
+        localStorage.setItem("pdf_active_view", activeView);
+      }
+    } catch {}
+  }, [activeView]);
+
   const handleUploadSuccess = useCallback(
     (data: BatchSuccessData) => {
       const formatted = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -172,6 +202,12 @@ export default function DashboardPage() {
       setBatches((prev) => prev.filter((b) => b.id !== batchId));
       setSelectedBatchId((prev) => (prev === batchId ? null : prev));
       setShowSummary((prev) => (selectedBatchId === batchId ? false : prev));
+      try {
+        localStorage.removeItem(`pdf_chat_batch_${batchId}`);
+        if (selectedBatchId === batchId) {
+          localStorage.removeItem("pdf_selected_batch_id");
+        }
+      } catch {}
     },
     [authToken, selectedBatchId]
   );

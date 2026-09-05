@@ -38,6 +38,16 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
   const isMultiDoc = !!(batchId && documentCount && documentCount > 1) || effectiveDocIds.length > 1;
   const count = documentCount || effectiveDocIds.length || 1;
 
+  const storageKey = shareToken
+    ? null
+    : batchId
+    ? `pdf_chat_batch_${batchId}`
+    : documentId
+    ? `pdf_chat_doc_${documentId}`
+    : effectiveDocIds.length > 0
+    ? `pdf_chat_docs_${effectiveDocIds.slice().sort().join("_")}`
+    : null;
+
   const welcomeMessage: Message = {
     id: "welcome",
     role: "assistant",
@@ -103,6 +113,47 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shareToken]);
 
+  // ── Load persisted chat from localStorage on mount/switch (authenticated chats) ──
+  useEffect(() => {
+    if (shareToken || !storageKey || typeof window === "undefined") return;
+
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(
+            parsed.map((m: any) => ({
+              ...m,
+              timestamp: new Date(m.timestamp),
+            }))
+          );
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn("[ChatWindow] Could not restore local chat history:", err);
+    }
+    setMessages([welcomeMessage]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey, shareToken]);
+
+  // ── Save messages to localStorage on change (authenticated chats) ──────────
+  useEffect(() => {
+    if (shareToken || !storageKey || typeof window === "undefined") return;
+
+    try {
+      const validMessages = messages.filter((m) => !m.isError);
+      if (validMessages.length > 1) {
+        localStorage.setItem(storageKey, JSON.stringify(validMessages));
+      } else if (validMessages.length === 1 && validMessages[0].id === "welcome") {
+        localStorage.removeItem(storageKey);
+      }
+    } catch (err) {
+      console.warn("[ChatWindow] Could not persist chat history:", err);
+    }
+  }, [messages, storageKey, shareToken]);
+
   // Auto-scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -133,8 +184,10 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
 
     try {
       // Build chat history for backend (exclude welcome message and errors)
+      // Send the last 6 turns (up to 12 messages: 6 user + 6 assistant)
       const history = messages
         .filter((m) => m.id !== "welcome" && !m.isError)
+        .slice(-12)
         .map((m) => ({ role: m.role, content: m.content }));
 
       let endpoint: string;
@@ -215,7 +268,7 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
       setIsLoading(false);
       textareaRef.current?.focus();
     }
-  }, [input, isLoading, messages, documentId, documentIds, shareToken]);
+  }, [input, isLoading, messages, batchId, documentId, effectiveDocIds, shareToken]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -225,6 +278,11 @@ export default function ChatWindow({ batchId, documentId, documentIds, filename,
   };
 
   const clearChat = () => {
+    if (storageKey && typeof window !== "undefined") {
+      try {
+        localStorage.removeItem(storageKey);
+      } catch {}
+    }
     setMessages([
       {
         id: "welcome",
