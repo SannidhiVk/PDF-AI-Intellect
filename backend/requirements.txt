@@ -13,3 +13,4 @@ tenacity
 slowapi==0.1.9
 limits==3.14.1
 pydantic[email]
+email-validator

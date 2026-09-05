@@ -246,11 +246,11 @@ MAX_PDF_BYTES = 20 * 1024 * 1024  # 20 MB hard cap per PDF file
 # ── Share Expiry Constant ──────────────────────────────────────────────────────
 SHARE_EXPIRY_DAYS = 10
 
-# ── Share Token Regex (UUID format only) ──────────────────────────────────────
-# Reject non-UUID tokens before they touch Postgres — prevents path-traversal
-# probes and avoids a raw 22P02 Postgres error on malformed input.
+# ── Share Token Regex (Supports 32-char hex, standard UUIDs, and safe tokens) ─
+# Reject malformed tokens before they touch Postgres — prevents path-traversal
+# probes and avoids database errors on malformed input.
 _TOKEN_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    r'^[0-9a-zA-Z_\-]{16,64}$'
 )
 
 
@@ -966,8 +966,17 @@ def _get_active_share(token: str) -> dict:
     return share
 
 
-def _build_share_url(token: str) -> str:
-    frontend = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+def _build_share_url(token: str, request: Optional[Request] = None) -> str:
+    frontend = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
+    if not frontend and request:
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin:
+            from urllib.parse import urlparse
+            parsed = urlparse(origin)
+            if parsed.scheme and parsed.netloc:
+                frontend = f"{parsed.scheme}://{parsed.netloc}"
+    if not frontend:
+        frontend = "http://localhost:3000"
     return f"{frontend}/share/{token}"
 
 
@@ -1011,6 +1020,7 @@ def _thread_comments(
     tags=["Sharing"],
 )
 async def create_share(
+    request: Request,
     document_id: str,
     user_id: str = Depends(get_current_user),
 ):
@@ -1024,7 +1034,7 @@ async def create_share(
 
     return ShareCreateResponse(
         share_token=str(share["share_token"]),
-        share_url=_build_share_url(share["share_token"]),
+        share_url=_build_share_url(share["share_token"], request=request),
         is_active=share["is_active"],
     )
 
@@ -1325,7 +1335,7 @@ async def send_share_invite(
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
-    share_url = _build_share_url(share["share_token"])
+    share_url = _build_share_url(share["share_token"], request=request)
 
     # Fetch doc name for the email
     doc = db_service.get_document_by_id(document_id, user_id=user_id)

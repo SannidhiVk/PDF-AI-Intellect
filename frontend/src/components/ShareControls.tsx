@@ -51,19 +51,24 @@ export default function ShareControls({
   const handleShare = useCallback(async () => {
     setSharing(true);
     try {
-      const res = await axios.post<{ share_url: string; is_active: boolean }>(
+      const res = await axios.post<{ share_token: string; share_url: string; is_active: boolean }>(
         `${FASTAPI_URL}/api/documents/${documentId}/share`,
         {},
         { headers: { Authorization: `Bearer ${authToken}` } }
       );
-      const url = res.data.share_url;
+      const url =
+        typeof window !== "undefined" && res.data.share_token
+          ? `${window.location.origin}/share/${res.data.share_token}`
+          : res.data.share_url;
       setShareUrl(url);
       setShareActive(true);
-      await navigator.clipboard.writeText(url);
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 2500);
-    } catch {
-      // silently ignore — user can retry
+    } catch (err) {
+      console.error("[ShareControls] handleShare error:", err);
     } finally {
       setSharing(false);
     }

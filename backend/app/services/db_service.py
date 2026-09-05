@@ -730,21 +730,17 @@ def revoke_share_by_token(token: str) -> bool:
 
 def get_share_by_token(token: str) -> dict[str, Any] | None:
     """
-    Fetch an *active* share row by its token UUID.
+    Fetch an *active* share row by its token (UUID or hex string).
     Uses the service-role client so it bypasses RLS.
 
     Returns None if the token is not found, malformed, or the share is
-    inactive. Malformed tokens (e.g. the frontend accidentally sending
-    the literal string "undefined") are rejected here BEFORE hitting
-    Postgres — otherwise PostgREST raises a raw 22P02 error ("invalid
-    input syntax for type uuid") which bubbles up as an unhandled 500
-    instead of a clean "not found".
+    inactive. Malformed tokens are rejected before querying Postgres.
     """
-    import uuid as _uuid
+    if not token or not isinstance(token, str) or len(token) > 64:
+        return None
 
-    try:
-        _uuid.UUID(str(token))
-    except (ValueError, AttributeError, TypeError):
+    import re
+    if not re.match(r'^[0-9a-zA-Z_\-]+$', token):
         return None
 
     response = (
