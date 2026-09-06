@@ -1418,13 +1418,6 @@ class ShareInviteRequest(BaseModel):
     )
 
 
-@app.post(
-    "/api/documents/{document_id}/share/invite",
-    status_code=status.HTTP_200_OK,
-    summary="Send a share-link invitation email to a recipient via Brevo",
-    tags=["Sharing"],
-)
-@limiter.limit("3/minute")
 async def _send_share_invite_email(
     *,
     recipient_email: str,
