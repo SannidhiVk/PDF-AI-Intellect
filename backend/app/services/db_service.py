@@ -612,31 +612,47 @@ def _get_service_client() -> Client:
 
 # ── Share Management ──────────────────────────────────────────────────────────
 
-def create_share(document_id: str, user_id: str) -> dict[str, Any]:
+def create_share(
+    user_id: str,
+    document_id: str | None = None,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
     """
-    Create (or re-activate) a share link for a document.
+    Create (or re-activate) a share link for EITHER a single document OR an
+    entire upload batch. Pass exactly one of `document_id` / `batch_id`.
 
-    If an inactive share already exists for this document it is re-activated
+    If an inactive share already exists for this target it is re-activated
     rather than creating a new row, keeping token URLs stable.
 
     Returns:
         The document_shares row as a dict.
 
-    IMPORTANT — required SQL migration:
-      The `created_by` column must exist in the live `document_shares` table.
-      If you see a 500 with 'column document_shares.created_by does not exist',
-      run this in the Supabase SQL Editor before using the sharing feature:
+    IMPORTANT — required SQL migration (run once in Supabase SQL Editor):
 
-          ALTER TABLE document_shares
-              ADD COLUMN IF NOT EXISTS created_by UUID
-              REFERENCES auth.users(id) ON DELETE CASCADE;
+        ALTER TABLE document_shares
+            ALTER COLUMN document_id DROP NOT NULL,
+            ADD COLUMN IF NOT EXISTS batch_id UUID
+                REFERENCES upload_batches(id) ON DELETE CASCADE,
+            ADD COLUMN IF NOT EXISTS created_by UUID
+                REFERENCES auth.users(id) ON DELETE CASCADE;
 
-          UPDATE document_shares SET created_by = (
-              SELECT user_id FROM documents
-              WHERE documents.id = document_shares.document_id
-          ) WHERE created_by IS NULL;
+        ALTER TABLE document_shares
+            ADD CONSTRAINT document_shares_target_check CHECK (
+                (document_id IS NOT NULL AND batch_id IS NULL) OR
+                (document_id IS NULL AND batch_id IS NOT NULL)
+            );
 
-          ALTER TABLE document_shares ALTER COLUMN created_by SET NOT NULL;
+        UPDATE document_shares SET created_by = (
+            SELECT user_id FROM documents
+            WHERE documents.id = document_shares.document_id
+        ) WHERE created_by IS NULL AND document_id IS NOT NULL;
+
+        ALTER TABLE document_shares ALTER COLUMN created_by SET NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_share_doc_owner
+            ON document_shares (document_id, created_by) WHERE document_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_share_batch_owner
+            ON document_shares (batch_id, created_by) WHERE batch_id IS NOT NULL;
 
     Note: uses the service-role client — the anon client never forwards the
     user's JWT to PostgREST, so auth.uid() is NULL for every call made through
@@ -644,19 +660,20 @@ def create_share(document_id: str, user_id: str) -> dict[str, Any]:
     insert/update unconditionally. Ownership is instead enforced here in Python
     via the .eq("created_by", user_id) filter.
     """
+    if not document_id and not batch_id:
+        raise ValueError("create_share requires either document_id or batch_id.")
+    if document_id and batch_id:
+        raise ValueError("create_share accepts only one of document_id / batch_id, not both.")
+
     client = _get_service_client()
 
-    # Check for existing row (active or inactive) owned by this user.
-    # Each document has at most one share row per owner, so filtering by
-    # both document_id and created_by uniquely identifies it.
-    existing = (
-        client.table("document_shares")
-        .select("*")
-        .eq("document_id", document_id)
-        .eq("created_by", user_id)
-        .limit(1)
-        .execute()
-    )
+    # Check for an existing row (active or inactive) owned by this user for
+    # this exact target. Each document/batch has at most one share row per
+    # owner, so filtering by target + created_by uniquely identifies it.
+    query = client.table("document_shares").select("*").eq("created_by", user_id)
+    query = query.eq("document_id", document_id) if document_id else query.is_("document_id", "null")
+    query = query.eq("batch_id", batch_id) if batch_id else query.is_("batch_id", "null")
+    existing = query.limit(1).execute()
 
     if existing.data:
         row = existing.data[0]
@@ -671,41 +688,51 @@ def create_share(document_id: str, user_id: str) -> dict[str, Any]:
             return updated.data[0]
         return row
 
-    # No existing row — create a fresh share link for this document + owner
+    # No existing row — create a fresh share link for this target + owner
     response = (
         client.table("document_shares")
-        .insert({"document_id": document_id, "created_by": user_id})
+        .insert({"document_id": document_id, "batch_id": batch_id, "created_by": user_id})
         .execute()
     )
     if not response.data:
+        target = f"document {document_id}" if document_id else f"batch {batch_id}"
         raise RuntimeError(
-            f"Failed to create share link for document {document_id}. "
+            f"Failed to create share link for {target}. "
             f"Supabase response: {response}. "
-            "If you see '42703 column document_shares.created_by does not exist', "
-            "run the SQL migration shown in the create_share() docstring above."
+            "If you see '42703 column document_shares.batch_id does not exist' "
+            "(or created_by), run the SQL migration shown in the create_share() "
+            "docstring above."
         )
     return response.data[0]
 
 
-def revoke_share(document_id: str, user_id: str) -> bool:
+def revoke_share(
+    user_id: str,
+    document_id: str | None = None,
+    batch_id: str | None = None,
+) -> bool:
     """
-    Deactivate the share link for a document (sets is_active = FALSE).
+    Deactivate the share link for a document OR a batch (sets is_active = FALSE).
+    Pass exactly one of `document_id` / `batch_id`.
 
     Returns True if a row was updated, False if no active share existed.
 
-    Filters by both document_id AND created_by so only the owner can
+    Filters by both the target AND created_by so only the owner can
     revoke their own share. Uses the service-role client to bypass RLS
     (same reason as create_share — auth.uid() is always NULL for
     server-side Python requests).
     """
-    response = (
+    if not document_id and not batch_id:
+        raise ValueError("revoke_share requires either document_id or batch_id.")
+
+    query = (
         _get_service_client().table("document_shares")
         .update({"is_active": False})
-        .eq("document_id", document_id)
         .eq("created_by", user_id)
         .eq("is_active", True)
-        .execute()
     )
+    query = query.eq("document_id", document_id) if document_id else query.eq("batch_id", batch_id)
+    response = query.execute()
     return bool(response.data)
 
 
@@ -745,7 +772,11 @@ def get_share_by_token(token: str) -> dict[str, Any] | None:
 
     response = (
         _get_service_client().table("document_shares")
-        .select("*, documents(id, file_name, summary)")
+        .select(
+            "*, "
+            "documents(id, file_name, summary), "
+            "upload_batches(id, title, documents(id, file_name, summary))"
+        )
         .eq("share_token", token)
         .eq("is_active", True)
         .limit(1)

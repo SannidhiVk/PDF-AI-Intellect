@@ -6,10 +6,16 @@
  * Public shareable document page. No authentication required.
  * The share token in the URL is the access control.
  *
- * Three tabs:
- *   1. Summary — Document filename + AI-generated summary (read-only)
- *   2. Chat    — Full RAG AI chat via /api/share/{token}/chat
- *   3. Comments — Threaded comments + post form (guests welcome)
+ * Supports TWO share shapes returned by GET /api/share/{token}:
+ *   1. Single-document share -> { document_id, file_name, summary }
+ *   2. Batch share           -> { batch_id, title, documents: [...] }
+ *
+ * Tabs:
+ *   1. Summary  — per-document (uses a picker strip when it's a batch)
+ *   2. Chat     — RAG chat via /api/share/{token}/chat.
+ *                 For a batch share, chat queries ALL documents in the
+ *                 batch together (batch_id is sent, not a single document_id).
+ *   3. Comments — threaded comments, scoped to the currently selected document
  */
 
 import { useState, useEffect } from "react";
@@ -24,6 +30,7 @@ import {
   AlertTriangle,
   Link2Off,
   BookOpen,
+  Layers,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -35,10 +42,23 @@ const FASTAPI_URL = process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:800
 
 type Tab = "summary" | "chat" | "comments";
 
-interface ShareInfo {
+interface DocumentSummary {
   document_id: string;
   file_name: string;
   summary: string | null;
+}
+
+// Union of what GET /api/share/{token} can return.
+// Batch shares include `documents`; single-doc shares don't.
+interface ShareInfo {
+  // batch shape
+  batch_id?: string;
+  title?: string;
+  documents?: DocumentSummary[];
+  // single-document shape
+  document_id?: string;
+  file_name?: string;
+  summary?: string | null;
 }
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
@@ -51,12 +71,17 @@ export default function SharePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("summary");
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!token) return;
     axios
       .get<ShareInfo>(`${FASTAPI_URL}/api/share/${token}`)
-      .then((res) => setShareInfo(res.data))
+      .then((res) => {
+        setShareInfo(res.data);
+        const firstDoc = res.data.documents?.[0];
+        setActiveDocId(firstDoc?.document_id ?? res.data.document_id ?? null);
+      })
       .catch((err) => {
         if (axios.isAxiosError(err) && err.response?.status === 404) {
           setError("This share link is no longer active or does not exist.");
@@ -106,16 +131,36 @@ export default function SharePage() {
 
   if (!shareInfo) return null;
 
+  const isBatch = Boolean(shareInfo.documents?.length);
+  const docs: DocumentSummary[] = isBatch
+    ? shareInfo.documents!
+    : [
+        {
+          document_id: shareInfo.document_id!,
+          file_name: shareInfo.file_name!,
+          summary: shareInfo.summary ?? null,
+        },
+      ];
+  const currentDoc = docs.find((d) => d.document_id === activeDocId) ?? docs[0];
+  const headerTitle = isBatch ? shareInfo.title || `${docs.length} documents` : currentDoc.file_name;
+  const headerSubtitle = isBatch
+    ? `Shared batch — ${docs.length} files — view only`
+    : "Shared document — view only";
+
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
       {/* Top banner */}
       <header className="sticky top-0 z-20 flex items-center gap-4 px-6 py-4 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-sm">
         <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-lg shadow-violet-900/30 shrink-0">
-          <FileText className="h-4 w-4 text-white" />
+          {isBatch ? (
+            <Layers className="h-4 w-4 text-white" />
+          ) : (
+            <FileText className="h-4 w-4 text-white" />
+          )}
         </div>
         <div className="min-w-0">
-          <h1 className="text-sm font-semibold text-white truncate">{shareInfo.file_name}</h1>
-          <p className="text-xs text-gray-500">Shared document — view only</p>
+          <h1 className="text-sm font-semibold text-white truncate">{headerTitle}</h1>
+          <p className="text-xs text-gray-500">{headerSubtitle}</p>
         </div>
 
         {/* Tab switcher */}
@@ -143,20 +188,44 @@ export default function SharePage() {
 
       {/* Content */}
       <main className="mx-auto max-w-3xl px-4 py-8">
+        {/* Document picker — only shown for batch shares, and only relevant
+            to Summary/Comments (Chat is always batch-wide). */}
+        {isBatch && activeTab !== "chat" && (
+          <div className="mb-6 flex flex-wrap gap-2">
+            {docs.map((doc) => (
+              <button
+                key={doc.document_id}
+                onClick={() => setActiveDocId(doc.document_id)}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition-colors",
+                  doc.document_id === currentDoc.document_id
+                    ? "bg-violet-600 border-violet-500 text-white"
+                    : "bg-gray-900 border-gray-800 text-gray-400 hover:text-gray-200"
+                )}
+              >
+                <FileText className="h-3.5 w-3.5" />
+                {doc.file_name}
+              </button>
+            ))}
+          </div>
+        )}
+
         {activeTab === "summary" && (
-          <PublicSummaryView
-            token={token}
-            filename={shareInfo.file_name}
-            summary={shareInfo.summary}
-          />
+          <PublicSummaryView filename={currentDoc.file_name} summary={currentDoc.summary} />
         )}
 
         {activeTab === "chat" && (
           <div style={{ height: "calc(100vh - 160px)" }}>
-            <ChatWindow
-              filename={shareInfo.file_name}
-              shareToken={token}
-            />
+            {isBatch ? (
+              <ChatWindow
+                filename={headerTitle}
+                shareToken={token}
+                batchId={shareInfo.batch_id}
+                documentCount={docs.length}
+              />
+            ) : (
+              <ChatWindow filename={currentDoc.file_name} shareToken={token} />
+            )}
           </div>
         )}
 
@@ -164,6 +233,7 @@ export default function SharePage() {
           <CommentSection
             mode="shared"
             shareToken={token}
+            documentId={currentDoc.document_id}
           />
         )}
       </main>
@@ -172,14 +242,11 @@ export default function SharePage() {
 }
 
 // ── Public Summary View ───────────────────────────────────────────────────────
-// Displays the AI-generated summary fetched from /api/share/{token}.
 
 function PublicSummaryView({
-  token,
   filename,
   summary,
 }: {
-  token: string;
   filename: string;
   summary: string | null;
 }) {

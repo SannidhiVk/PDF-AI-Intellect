@@ -71,16 +71,19 @@ function relativeTime(iso: string): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// For "shared" mode, documentId is optional: single-document shares don't
+// need it (the backend resolves it from the token), but batch shares must
+// pass it so the backend knows which file in the batch the comment belongs to.
 function listUrl(mode: "owner" | "shared", documentId?: string, shareToken?: string) {
-  return mode === "owner"
-    ? `${FASTAPI_URL}/api/documents/${documentId}/comments`
-    : `${FASTAPI_URL}/api/share/${shareToken}/comments`;
+  if (mode === "owner") return `${FASTAPI_URL}/api/documents/${documentId}/comments`;
+  const base = `${FASTAPI_URL}/api/share/${shareToken}/comments`;
+  return documentId ? `${base}?document_id=${encodeURIComponent(documentId)}` : base;
 }
 
 function postUrl(mode: "owner" | "shared", documentId?: string, shareToken?: string) {
-  return mode === "owner"
-    ? `${FASTAPI_URL}/api/documents/${documentId}/comments` // owner posts directly, no share link required
-    : `${FASTAPI_URL}/api/share/${shareToken}/comments`;
+  if (mode === "owner") return `${FASTAPI_URL}/api/documents/${documentId}/comments`; // owner posts directly, no share link required
+  const base = `${FASTAPI_URL}/api/share/${shareToken}/comments`;
+  return documentId ? `${base}?document_id=${encodeURIComponent(documentId)}` : base;
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
@@ -125,6 +128,9 @@ export default function CommentSection({
     }
   }, [mode, documentId, shareToken, authToken]);
 
+  // fetchComments already depends on `documentId` (via useCallback below),
+  // so switching the picker in a batch share automatically reloads the
+  // right thread — no extra dependency needed here.
   useEffect(() => {
     if (!collapsed) fetchComments();
   }, [collapsed, fetchComments]);

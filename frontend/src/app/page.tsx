@@ -221,7 +221,11 @@ export default function DashboardPage() {
   }
 
   const selectedBatch = batches.find((b) => b.id === selectedBatchId) ?? null;
-  const primaryDocId = selectedBatch?.documents[0]?.id ?? null;
+  // A batch always has its own share target now — we share the WHOLE batch
+  // (all files together), not just the first document in it. For a batch of
+  // exactly one file this is equivalent to sharing that single document, but
+  // it now correctly stays keyed to batch_id either way, so the generated
+  // link always resolves via GET /api/share/{token} -> { batch_id, documents: [...] }.
 
   const handleSelectHistory = (batchId: string) => {
     setSelectedBatchId(batchId);
@@ -273,12 +277,12 @@ export default function DashboardPage() {
             </p>
           </div>
 
-          {/* Share controls for primary document */}
-          {primaryDocId && authToken && (
+          {/* Share controls for the currently selected batch (all its files) */}
+          {selectedBatch && authToken && (
             <div className="flex-shrink-0">
               <ShareControls
-                key={primaryDocId}
-                documentId={primaryDocId}
+                key={selectedBatch.id}
+                batchId={selectedBatch.id}
                 authToken={authToken}
               />
             </div>

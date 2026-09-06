@@ -820,10 +820,21 @@ class ShareCreateResponse(BaseModel):
     is_active: bool
 
 
-class ShareInfoResponse(BaseModel):
+class SharedDocumentSummary(BaseModel):
     document_id: str
     file_name: str
     summary: str | None = None
+
+
+class ShareInfoResponse(BaseModel):
+    # ── Single-document share shape ──
+    document_id: str | None = None
+    file_name: str | None = None
+    summary: str | None = None
+    # ── Batch share shape ──
+    batch_id: str | None = None
+    title: str | None = None
+    documents: list[SharedDocumentSummary] | None = None
 
 
 class CommentCreate(BaseModel):
@@ -1058,6 +1069,60 @@ async def revoke_share(
     return {"message": "Share link revoked successfully."}
 
 
+@app.post(
+    "/api/batches/{batch_id}/share",
+    response_model=ShareCreateResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Create or re-activate a shareable link for an entire upload batch",
+    tags=["Sharing"],
+)
+async def create_batch_share(
+    request: Request,
+    batch_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    # Verify ownership before creating a share for it.
+    batch = db_service.get_batch_by_id(batch_id, user_id=user_id)
+    if not batch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Batch not found or you do not have permission to access it.",
+        )
+
+    try:
+        share = db_service.create_share(user_id=user_id, batch_id=batch_id)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+
+    return ShareCreateResponse(
+        share_token=str(share["share_token"]),
+        share_url=_build_share_url(share["share_token"], request=request),
+        is_active=share["is_active"],
+    )
+
+
+@app.delete(
+    "/api/batches/{batch_id}/share",
+    status_code=status.HTTP_200_OK,
+    summary="Revoke (deactivate) the shareable link for an upload batch",
+    tags=["Sharing"],
+)
+async def revoke_batch_share(
+    batch_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    revoked = db_service.revoke_share(user_id=user_id, batch_id=batch_id)
+    if not revoked:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active share link found for this batch.",
+        )
+    return {"message": "Share link revoked successfully."}
+
+
 @app.get(
     "/api/share/{token}",
     response_model=ShareInfoResponse,
@@ -1066,6 +1131,23 @@ async def revoke_share(
 )
 async def get_share_info(token: str):
     share = _get_active_share(token)
+
+    if share.get("batch_id"):
+        batch = share.get("upload_batches") or {}
+        docs = batch.get("documents") or []
+        return ShareInfoResponse(
+            batch_id=share["batch_id"],
+            title=batch.get("title"),
+            documents=[
+                SharedDocumentSummary(
+                    document_id=d["id"],
+                    file_name=d.get("file_name", "Document"),
+                    summary=d.get("summary"),
+                )
+                for d in docs
+            ],
+        )
+
     doc = share.get("documents") or {}
     return ShareInfoResponse(
         document_id=share["document_id"],
@@ -1083,7 +1165,8 @@ async def get_share_info(token: str):
 @limiter.limit("10/minute")
 async def share_chat(request: Request, token: str, body: ShareChatRequest):
     share = _get_active_share(token)
-    document_id = share["document_id"]
+    is_batch = bool(share.get("batch_id"))
+    document_id = None if is_batch else share["document_id"]
 
     if not body.question.strip():
         raise HTTPException(
@@ -1099,14 +1182,22 @@ async def share_chat(request: Request, token: str, body: ShareChatRequest):
             detail=f"Failed to generate query embedding: {exc}",
         )
 
-    RAG_MATCH_COUNT = 5
+    RAG_MATCH_COUNT = 8 if is_batch else 5
     try:
-        context_chunks = db_service.search_similar_chunks(
-            document_id=document_id,
-            query_embedding=query_embedding,
-            match_count=RAG_MATCH_COUNT,
-            match_threshold=0.0,
-        )
+        if is_batch:
+            context_chunks = db_service.search_similar_chunks_by_batch(
+                batch_id=share["batch_id"],
+                query_embedding=query_embedding,
+                match_count=RAG_MATCH_COUNT,
+                match_threshold=0.0,
+            )
+        else:
+            context_chunks = db_service.search_similar_chunks(
+                document_id=document_id,
+                query_embedding=query_embedding,
+                match_count=RAG_MATCH_COUNT,
+                match_threshold=0.0,
+            )
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1139,22 +1230,46 @@ async def share_chat(request: Request, token: str, body: ShareChatRequest):
 
     return ChatResponse(
         document_id=document_id,
+        batch_id=share.get("batch_id"),
         question=body.question,
         answer=answer,
         sources_used=len(context_chunks),
     )
 
 
+def _resolve_share_document_id(share: dict, document_id: Optional[str]) -> str:
+    """
+    Resolve which document a shared-link comment action applies to.
+
+    - Single-document share: always use share['document_id']; any
+      caller-supplied document_id is ignored (it can only be that one doc).
+    - Batch share: the caller MUST supply document_id, and it must actually
+      belong to this batch — this prevents a guest from passing an arbitrary
+      document_id belonging to someone else's document.
+    """
+    if share.get("batch_id"):
+        batch = share.get("upload_batches") or {}
+        valid_ids = {d["id"] for d in (batch.get("documents") or [])}
+        if not document_id or document_id not in valid_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A valid document_id (belonging to this shared batch) is required.",
+            )
+        return document_id
+    return share["document_id"]
+
+
 @app.get(
     "/api/share/{token}/comments",
     response_model=list[CommentResponse],
-    summary="List comments for a shared document (public)",
+    summary="List comments for a shared document or a document within a shared batch (public)",
     tags=["Comments"],
 )
 @limiter.limit("30/minute")
-async def list_shared_comments(request: Request, token: str):
+async def list_shared_comments(request: Request, token: str, document_id: Optional[str] = None):
     share = _get_active_share(token)
-    flat = db_service.get_comments(share["document_id"])
+    resolved_document_id = _resolve_share_document_id(share, document_id)
+    flat = db_service.get_comments(resolved_document_id)
     return _thread_comments(flat, requesting_user_id=None)
 
 
@@ -1162,12 +1277,18 @@ async def list_shared_comments(request: Request, token: str):
     "/api/share/{token}/comments",
     response_model=CommentResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Post a comment on a shared document (guests welcome)",
+    summary="Post a comment on a shared document or a document within a shared batch (guests welcome)",
     tags=["Comments"],
 )
 @limiter.limit("5/minute")
-async def post_shared_comment(request: Request, token: str, body: CommentCreate):
+async def post_shared_comment(
+    request: Request,
+    token: str,
+    body: CommentCreate,
+    document_id: Optional[str] = None,
+):
     share = _get_active_share(token)
+    resolved_document_id = _resolve_share_document_id(share, document_id)
 
     if not body.content.strip():
         raise HTTPException(
@@ -1182,7 +1303,7 @@ async def post_shared_comment(request: Request, token: str, body: CommentCreate)
 
     try:
         row = db_service.create_comment(
-            document_id=share["document_id"],
+            document_id=resolved_document_id,
             content=body.content.strip(),
             author_name=body.author_name.strip(),
             user_id=None,
@@ -1304,21 +1425,24 @@ class ShareInviteRequest(BaseModel):
     tags=["Sharing"],
 )
 @limiter.limit("3/minute")
-async def send_share_invite(
-    request: Request,
-    document_id: str,
-    body: ShareInviteRequest,
-    user_id: str = Depends(get_current_user),
-):
+async def _send_share_invite_email(
+    *,
+    recipient_email: str,
+    sender_name: str,
+    subject_target_name: str,
+    card_title: str,
+    card_subtitle: str,
+    share_url: str,
+) -> None:
     """
-    Sends a formatted email to `recipient_email` containing the document's
-    active share link using Brevo's transactional API. Requires BREVO_API_KEY in .env.
+    Shared Brevo transactional-email sender used by both the single-document
+    and batch invite endpoints. Raises HTTPException on any failure.
     """
     import httpx
 
     brevo_api_key = os.environ.get("BREVO_API_KEY", "").strip()
     sender_email = os.environ.get("BREVO_SENDER_EMAIL", "no-reply@pdfintellect.com").strip()
-    sender_name = os.environ.get("BREVO_SENDER_NAME", "PDF Intellect").strip()
+    from_name = os.environ.get("BREVO_SENDER_NAME", "PDF Intellect").strip()
 
     if not brevo_api_key:
         raise HTTPException(
@@ -1328,18 +1452,6 @@ async def send_share_invite(
                 "Add BREVO_API_KEY to your backend/.env file."
             ),
         )
-
-    # Get or create the share link
-    try:
-        share = db_service.create_share(document_id=document_id, user_id=user_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
-
-    share_url = _build_share_url(share["share_token"], request=request)
-
-    # Fetch doc name for the email
-    doc = db_service.get_document_by_id(document_id, user_id=user_id)
-    file_name = doc.get("file_name", "a document") if doc else "a document"
 
     html_body = f"""
     <div style="font-family:Inter,sans-serif;background:#0a0a0f;padding:40px 0;min-height:100vh">
@@ -1353,7 +1465,7 @@ async def send_share_invite(
         <div style="padding:36px 40px">
           <p style="color:#e5e7eb;font-size:15px;line-height:1.6;margin:0 0 20px">
             Hi there,<br><br>
-            <strong style="color:#fff">{body.sender_name}</strong> has shared a document with you on
+            <strong style="color:#fff">{sender_name}</strong> has shared {subject_target_name} with you on
             <strong style="color:#fff">PDF Intellect</strong>:
           </p>
           <!-- Doc card -->
@@ -1361,8 +1473,8 @@ async def send_share_invite(
             <div style="display:flex;align-items:center;gap:12px">
               <div style="background:linear-gradient(135deg,#6d28d9,#4f46e5);border-radius:10px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">📄</div>
               <div>
-                <div style="color:#f3f4f6;font-weight:600;font-size:14px">{file_name}</div>
-                <div style="color:#6b7280;font-size:12px;margin-top:2px">Shared with you · No account needed</div>
+                <div style="color:#f3f4f6;font-weight:600;font-size:14px">{card_title}</div>
+                <div style="color:#6b7280;font-size:12px;margin-top:2px">{card_subtitle}</div>
               </div>
             </div>
           </div>
@@ -1389,12 +1501,11 @@ async def send_share_invite(
     """
 
     payload = {
-        "sender": {"name": sender_name, "email": sender_email},
-        "to": [{"email": body.recipient_email}],
-        "subject": f"{body.sender_name} shared \"{file_name}\" with you",
+        "sender": {"name": from_name, "email": sender_email},
+        "to": [{"email": recipient_email}],
+        "subject": f"{sender_name} shared \"{card_title}\" with you",
         "htmlContent": html_body,
     }
-
     headers = {
         "accept": "application/json",
         "api-key": brevo_api_key,
@@ -1412,11 +1523,95 @@ async def send_share_invite(
                 res_data = res.json() if res.headers.get("content-type") == "application/json" else {}
                 err_msg = res_data.get("message") or res.text
                 raise Exception(f"Brevo API Error ({res.status_code}): {err_msg}")
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to send email via Brevo: {exc}",
         )
+
+
+@app.post(
+    "/api/documents/{document_id}/share/invite",
+    status_code=status.HTTP_200_OK,
+    summary="Send a share-link invitation email to a recipient via Brevo",
+    tags=["Sharing"],
+)
+@limiter.limit("3/minute")
+async def send_share_invite(
+    request: Request,
+    document_id: str,
+    body: ShareInviteRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """
+    Sends a formatted email to `recipient_email` containing the document's
+    active share link using Brevo's transactional API. Requires BREVO_API_KEY in .env.
+    """
+    try:
+        share = db_service.create_share(document_id=document_id, user_id=user_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    share_url = _build_share_url(share["share_token"], request=request)
+
+    doc = db_service.get_document_by_id(document_id, user_id=user_id)
+    file_name = doc.get("file_name", "a document") if doc else "a document"
+
+    await _send_share_invite_email(
+        recipient_email=body.recipient_email,
+        sender_name=body.sender_name,
+        subject_target_name="a document",
+        card_title=file_name,
+        card_subtitle="Shared with you · No account needed",
+        share_url=share_url,
+    )
+
+    return {
+        "message": f"Invitation sent to {body.recipient_email}.",
+        "share_url": share_url,
+    }
+
+
+@app.post(
+    "/api/batches/{batch_id}/share/invite",
+    status_code=status.HTTP_200_OK,
+    summary="Send a share-link invitation email for an entire upload batch via Brevo",
+    tags=["Sharing"],
+)
+@limiter.limit("3/minute")
+async def send_batch_share_invite(
+    request: Request,
+    batch_id: str,
+    body: ShareInviteRequest,
+    user_id: str = Depends(get_current_user),
+):
+    batch = db_service.get_batch_by_id(batch_id, user_id=user_id)
+    if not batch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Batch not found or you do not have permission to access it.",
+        )
+
+    try:
+        share = db_service.create_share(user_id=user_id, batch_id=batch_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    share_url = _build_share_url(share["share_token"], request=request)
+
+    doc_count = len(batch.get("documents") or [])
+    batch_title = batch.get("title") or f"{doc_count} documents"
+
+    await _send_share_invite_email(
+        recipient_email=body.recipient_email,
+        sender_name=body.sender_name,
+        subject_target_name=f"{doc_count} documents",
+        card_title=batch_title,
+        card_subtitle=f"Shared batch · {doc_count} files · No account needed",
+        share_url=share_url,
+    )
 
     return {
         "message": f"Invitation sent to {body.recipient_email}.",

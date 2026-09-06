@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   Link2,
   Link2Off,
@@ -16,8 +16,13 @@ const FASTAPI_URL =
   process.env.NEXT_PUBLIC_FASTAPI_URL || "http://127.0.0.1:8000";
 
 interface ShareControlsProps {
-  /** The document to share/revoke */
-  documentId: string;
+  /**
+   * Exactly one of these must be set:
+   * - `documentId`: share a single document
+   * - `batchId`: share the entire upload batch (all files together)
+   */
+  documentId?: string;
+  batchId?: string;
   /** Owner's JWT */
   authToken: string;
 }
@@ -26,13 +31,26 @@ interface ShareControlsProps {
  * ShareControls — Copy Link · Invite · Revoke
  *
  * Fully self-contained share widget. Designed to live in the top header so it
- * is accessible at any time while a document is selected, not only after the
- * summary is shown.
+ * is accessible at any time while a document (or batch) is selected, not only
+ * after the summary is shown.
+ *
+ * Renders identically whether sharing a single document or a whole batch —
+ * the caller decides which by passing `documentId` OR `batchId`, and this
+ * component picks the matching REST endpoint automatically:
+ *   /api/documents/{id}/share(/invite)   vs.   /api/batches/{id}/share(/invite)
  */
 export default function ShareControls({
   documentId,
+  batchId,
   authToken,
 }: ShareControlsProps) {
+  if (!documentId && !batchId) {
+    console.error("[ShareControls] Either documentId or batchId is required.");
+  }
+  const isBatch = Boolean(batchId);
+  const targetId = (isBatch ? batchId : documentId) as string;
+  const basePath = isBatch ? `${FASTAPI_URL}/api/batches` : `${FASTAPI_URL}/api/documents`;
+
   // ── Share state ───────────────────────────────────────────────────────────
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [shareActive, setShareActive] = useState(false);
@@ -48,11 +66,24 @@ export default function ShareControls({
   const [inviteError, setInviteError] = useState<string | null>(null);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
+  // Reset all share state whenever the target changes (e.g. user switches
+  // which document is selected within a batch view) — otherwise this
+  // component would keep showing the PREVIOUS target's share link/state.
+  useEffect(() => {
+    setShareUrl(null);
+    setShareActive(false);
+    setCopied(false);
+    setShowInvite(false);
+    setInviteEmail("");
+    setInviteSent(false);
+    setInviteError(null);
+  }, [targetId]);
+
   const handleShare = useCallback(async () => {
     setSharing(true);
     try {
       const res = await axios.post<{ share_token: string; share_url: string; is_active: boolean }>(
-        `${FASTAPI_URL}/api/documents/${documentId}/share`,
+        `${basePath}/${targetId}/share`,
         {},
         { headers: { Authorization: `Bearer ${authToken}` } }
       );
@@ -72,7 +103,7 @@ export default function ShareControls({
     } finally {
       setSharing(false);
     }
-  }, [documentId, authToken]);
+  }, [basePath, targetId, authToken]);
 
   const handleCopy = useCallback(async () => {
     if (!shareUrl) return;
@@ -84,7 +115,7 @@ export default function ShareControls({
   const handleRevoke = useCallback(async () => {
     setRevoking(true);
     try {
-      await axios.delete(`${FASTAPI_URL}/api/documents/${documentId}/share`, {
+      await axios.delete(`${basePath}/${targetId}/share`, {
         headers: { Authorization: `Bearer ${authToken}` },
       });
       setShareUrl(null);
@@ -97,7 +128,7 @@ export default function ShareControls({
     } finally {
       setRevoking(false);
     }
-  }, [documentId, authToken]);
+  }, [basePath, targetId, authToken]);
 
   const handleInvite = useCallback(
     async (e: React.FormEvent) => {
@@ -107,7 +138,7 @@ export default function ShareControls({
       setInviteError(null);
       try {
         await axios.post(
-          `${FASTAPI_URL}/api/documents/${documentId}/share/invite`,
+          `${basePath}/${targetId}/share/invite`,
           {
             recipient_email: inviteEmail.trim(),
             sender_name: "A PDF Intellect user",
@@ -132,7 +163,7 @@ export default function ShareControls({
         setInviting(false);
       }
     },
-    [documentId, authToken, inviteEmail]
+    [basePath, targetId, authToken, inviteEmail]
   );
 
   return (
